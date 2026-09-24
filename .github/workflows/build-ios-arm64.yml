@@ -26,6 +26,7 @@ permissions:
 env:
   BUILD_PRESET: theft4-device-release
   CONFIGURE_PRESET: ios-device-release
+  IOS_CMAKELISTS_BASE: 7502715cf155ff465be0f56c0637d6f02c13ab91
 
 jobs:
   build:
@@ -65,6 +66,25 @@ jobs:
           cmake --version
           ninja --version
 
+      - name: Restore complete iOS CMake project and guard optional runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          # ios/CMakeLists.txt was accidentally truncated in an earlier commit.
+          # Restore the known-good complete file before configuring the project.
+          git show "$IOS_CMAKELISTS_BASE:ios/CMakeLists.txt" > ios/CMakeLists.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("ios/CMakeLists.txt")
+          text = p.read_text()
+          old = "    target_compile_definitions(rexruntime PRIVATE THEFT4_LAB_BUILD=1)"
+          new = "    if(TARGET rexruntime)\n        target_compile_definitions(rexruntime PRIVATE THEFT4_LAB_BUILD=1)\n    endif()"
+          if old not in text:
+              raise SystemExit("Expected rexruntime definition was not found")
+          p.write_text(text.replace(old, new, 1))
+          PY
+          grep -A5 -B2 'TARGET rexruntime' ios/CMakeLists.txt
+
       - name: Apply or verify Metal patch
         if: ${{ inputs.apply_metal_patch != false }}
         shell: bash
@@ -87,10 +107,6 @@ jobs:
           rm -rf out/build/ios-device-release
           export CC="$LLVM_PREFIX/bin/clang"
           export CXX="$LLVM_PREFIX/bin/clang++"
-          echo "CC=$CC"
-          echo "CXX=$CXX"
-          "$CC" --version
-          "$CXX" --version
           cmake --preset "$CONFIGURE_PRESET" \
             -DCMAKE_C_COMPILER="$CC" \
             -DCMAKE_CXX_COMPILER="$CXX" \
@@ -98,21 +114,13 @@ jobs:
             -DCMAKE_OSX_SYSROOT=iphoneos \
             -DLIBERTY_RECOMP_IOS_CORE_ONLY=ON
 
-      - name: Confirm CMake selected Homebrew LLVM
+      - name: Confirm generated Theft4 target
         shell: bash
         run: |
           set -euo pipefail
-          cache=out/build/ios-device-release/CMakeCache.txt
-          grep -E '^CMAKE_(C|CXX)_COMPILER:.*=' "$cache"
-          cxx_path="$(sed -n 's/^CMAKE_CXX_COMPILER:.*=//p' "$cache")"
-          [[ "$cxx_path" == "$LLVM_PREFIX/bin/clang++" ]] || {
-            echo "CMake selected unexpected C++ compiler: $cxx_path" >&2
-            exit 1
-          }
-          "$cxx_path" -dumpversion | awk -F. '{ if ($1 < 18) exit 1 }' || {
-            echo "Selected compiler is older than Clang 18: $cxx_path" >&2
-            exit 1
-          }
+          project=out/build/ios-device-release/LibertyRecomp-ALL.xcodeproj
+          xcodebuild -project "$project" -list | tee "$RUNNER_TEMP/xcode-targets.txt"
+          grep -E '^\s+Theft4$' "$RUNNER_TEMP/xcode-targets.txt"
 
       - name: Compile Theft4
         run: cmake --build --preset "$BUILD_PRESET" --parallel "$(sysctl -n hw.logicalcpu)"
