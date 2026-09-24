@@ -47,11 +47,24 @@ jobs:
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-path
 
-      - name: Install build tools
+      - name: Install CMake, Ninja, and LLVM 18+
+        shell: bash
         run: |
-          brew install cmake ninja || true
+          set -euo pipefail
+          brew install cmake ninja llvm
+          llvm_prefix="$(brew --prefix llvm)"
+          echo "LLVM_PREFIX=$llvm_prefix" >> "$GITHUB_ENV"
+          echo "$llvm_prefix/bin" >> "$GITHUB_PATH"
           cmake --version
           ninja --version
+          "$llvm_prefix/bin/clang" --version
+          "$llvm_prefix/bin/clang++" --version
+
+          clang_major="$($llvm_prefix/bin/clang -dumpversion | cut -d. -f1)"
+          if [[ "$clang_major" -lt 18 ]]; then
+            echo "Homebrew LLVM must be 18 or newer; found $clang_major." >&2
+            exit 1
+          fi
 
       - name: Apply or verify Metal patch
         if: ${{ inputs.apply_metal_patch != false }}
@@ -69,10 +82,14 @@ jobs:
           fi
 
       - name: Configure iOS arm64 Release without embedded game files
-        run: cmake --preset "$CONFIGURE_PRESET"
-        env:
-          CMAKE_OSX_ARCHITECTURES: arm64
-          LIBERTY_RECOMP_IOS_CORE_ONLY: ON
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --preset "$CONFIGURE_PRESET" \
+            -DCMAKE_C_COMPILER="$LLVM_PREFIX/bin/clang" \
+            -DCMAKE_CXX_COMPILER="$LLVM_PREFIX/bin/clang++" \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DLIBERTY_RECOMP_IOS_CORE_ONLY=ON
 
       - name: Compile Theft4
         run: cmake --build --preset "$BUILD_PRESET" --parallel "$(sysctl -n hw.logicalcpu)"
