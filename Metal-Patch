@@ -1,0 +1,3607 @@
+diff --git a/glue/rexglue-sdk-main/include/rex/ui/presenter.h b/glue/rexglue-sdk-main/include/rex/ui/presenter.h
+index a7c11ee5..335a9c71 100644
+--- a/glue/rexglue-sdk-main/include/rex/ui/presenter.h
++++ b/glue/rexglue-sdk-main/include/rex/ui/presenter.h
+@@ -260,6 +260,14 @@ class Presenter {
+       // where available; currently still experimental due to limited temporal
+       // inputs in the presenter path.
+       kFsr3,
++#endif
++#if REX_PLATFORM_IOS
++      // THEFT4 LOCAL (non-upstream): Apple MetalFX spatial upscaler selection
++      // for the iOS bridge. The Vulkan presenter renders the guest output at
++      // scene resolution into an offscreen image; the iOS bridge exports the
++      // underlying MTLTexture and runs MTLFXSpatialScaler before presenting
++      // the drawable itself. All other platforms treat this as bilinear.
++      kMetalFx,
+ #endif
+     };
+ 
+diff --git a/glue/rexglue-sdk-main/include/rex/ui/vulkan/presenter.h b/glue/rexglue-sdk-main/include/rex/ui/vulkan/presenter.h
+index 68830e14..2edb5dae 100644
+--- a/glue/rexglue-sdk-main/include/rex/ui/vulkan/presenter.h
++++ b/glue/rexglue-sdk-main/include/rex/ui/vulkan/presenter.h
+@@ -510,6 +510,31 @@ class VulkanPresenter final : public Presenter {
+     bool swapchain_hdr_requested = false;
+     std::vector<VkImage> swapchain_images;
+     std::vector<SwapchainFramebuffer> swapchain_framebuffers;
++
++#if REX_PLATFORM_IOS
++    // THEFT4 LOCAL (non-upstream): MetalFX spatial offscreen present target.
++    // When the MetalFX route is active, the guest output is painted at scene
++    // resolution into this image (same format and render pass as the
++    // swapchain target) instead of an acquired swapchain image; the iOS
++    // bridge exports the underlying MTLTexture and presents the upscaled
++    // drawable itself, so no swapchain image is acquired or presented.
++    using PfnVkGetMTLTextureMVK = void(VKAPI_PTR*)(VkImage, void**);
++    VkFormat metalfx_format = VK_FORMAT_UNDEFINED;
++    VkExtent2D metalfx_extent = {};
++    VkImage metalfx_image = VK_NULL_HANDLE;
++    VkDeviceMemory metalfx_memory = VK_NULL_HANDLE;
++    VkImageView metalfx_view = VK_NULL_HANDLE;
++    VkFramebuffer metalfx_framebuffer = VK_NULL_HANDLE;
++    VkSemaphore metalfx_signal_semaphore = VK_NULL_HANDLE;
++    PfnVkGetMTLTextureMVK metalfx_get_mtl_texture = nullptr;
++    uint64_t metalfx_last_submission = 0;
++    // Destroys the MetalFX target above, if any. Called on target-size
++    // change and from PrepareForSwapchainRetirement.
++    void DestroyMetalFXTarget();
++    // (Re)creates the target for the given scene size and swapchain format;
++    // no-op when it already matches. Loads the MTLTexture export entry.
++    bool EnsureMetalFXTarget(uint32_t width, uint32_t height, VkFormat format);
++#endif
+   };
+ 
+   explicit VulkanPresenter(HostGpuLossCallback host_gpu_loss_callback,
+diff --git a/glue/rexglue-sdk-main/src/ui/presenter.cpp b/glue/rexglue-sdk-main/src/ui/presenter.cpp
+index 4449f94b..2bfc5fa0 100644
+--- a/glue/rexglue-sdk-main/src/ui/presenter.cpp
++++ b/glue/rexglue-sdk-main/src/ui/presenter.cpp
+@@ -43,8 +43,8 @@ REXCVAR_DEFINE_INT32(present_safe_area_y, 90, "UI/Presenter",
+ 
+ #if defined(REX_HAS_FIDELITYFX_FSR1)
+ REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
+-                      "Guest output effect: bilinear, cas, or FSR 1")
+-    .allowed({"bilinear", "cas", "fsr"})
++                      "Guest output effect: bilinear, cas, FSR 1, or metalfx (iOS only)")
++    .allowed({"bilinear", "cas", "fsr", "metalfx"})
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+ REXCVAR_DEFINE_DOUBLE(present_cas_additional_sharpness,
+@@ -105,6 +105,15 @@ GuestOutputPaintConfig::Effect ParsePresentEffect(const std::string& effect_name
+   if (lowered == "fsr") {
+     return GuestOutputPaintConfig::Effect::kFsr;
+   }
++  // THEFT4 LOCAL (non-upstream): iOS-only MetalFX spatial upscaler. Other
++  // platforms fall back to bilinear; see the kMetalFx enumerator note.
++  if (lowered == "metalfx") {
++#if REX_PLATFORM_IOS
++    return GuestOutputPaintConfig::Effect::kMetalFx;
++#else
++    return GuestOutputPaintConfig::Effect::kBilinear;
++#endif
++  }
+   if (lowered == "fsr2") {
+     return GuestOutputPaintConfig::Effect::kFsr2;
+   }
+diff --git a/glue/rexglue-sdk-main/src/ui/vulkan/vulkan_presenter.cpp b/glue/rexglue-sdk-main/src/ui/vulkan/vulkan_presenter.cpp
+index 2be2b9c7..792dda17 100644
+--- a/glue/rexglue-sdk-main/src/ui/vulkan/vulkan_presenter.cpp
++++ b/glue/rexglue-sdk-main/src/ui/vulkan/vulkan_presenter.cpp
+@@ -36,6 +36,7 @@
+ #include <rex/math.h>
+ #include <rex/platform.h>
+ #include <rex/ui/window.h>
++#include <rex/ui/flags.h>
+ #include <rex/ui/vulkan/presenter.h>
+ #include <rex/ui/vulkan/util.h>
+ 
+@@ -1724,6 +1725,11 @@ VkSwapchainKHR VulkanPresenter::PaintContext::PrepareForSwapchainRetirement() {
+   if (swapchain != VK_NULL_HANDLE) {
+     submission_tracker.AwaitAllSubmissionsCompletion();
+   }
++#if REX_PLATFORM_IOS
++  // THEFT4 LOCAL: the MetalFX offscreen target tracks the swapchain format;
++  // retire it alongside the swapchain so it is rebuilt on demand.
++  DestroyMetalFXTarget();
++#endif
+   const VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+   for (const SwapchainFramebuffer& framebuffer : swapchain_framebuffers) {
+@@ -1830,6 +1836,172 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
+   return true;
+ }
+ 
++#if REX_PLATFORM_IOS
++// THEFT4 LOCAL (non-upstream): MetalFX spatial present route. See the
++// PaintContext::metalfx_* members and the kMetalFx effect enumerator note.
++extern "C" {
++bool theft4_metalfx_available(void);
++bool theft4_metalfx_upscale_present(void* input_texture, uint32_t input_pixel_format,
++                                    uint32_t input_width, uint32_t input_height,
++                                    uint32_t output_width, uint32_t output_height);
++}  // extern "C"
++
++void VulkanPresenter::PaintContext::DestroyMetalFXTarget() {
++  const VulkanDevice::Functions& dfn = vulkan_device->functions();
++  const VkDevice device = vulkan_device->device();
++  if (metalfx_last_submission) {
++    submission_tracker.AwaitSubmissionCompletion(metalfx_last_submission);
++    metalfx_last_submission = 0;
++  }
++  if (metalfx_framebuffer != VK_NULL_HANDLE) {
++    dfn.vkDestroyFramebuffer(device, metalfx_framebuffer, nullptr);
++    metalfx_framebuffer = VK_NULL_HANDLE;
++  }
++  if (metalfx_view != VK_NULL_HANDLE) {
++    dfn.vkDestroyImageView(device, metalfx_view, nullptr);
++    metalfx_view = VK_NULL_HANDLE;
++  }
++  if (metalfx_image != VK_NULL_HANDLE) {
++    dfn.vkDestroyImage(device, metalfx_image, nullptr);
++    metalfx_image = VK_NULL_HANDLE;
++  }
++  if (metalfx_memory != VK_NULL_HANDLE) {
++    dfn.vkFreeMemory(device, metalfx_memory, nullptr);
++    metalfx_memory = VK_NULL_HANDLE;
++  }
++  if (metalfx_signal_semaphore != VK_NULL_HANDLE) {
++    dfn.vkDestroySemaphore(device, metalfx_signal_semaphore, nullptr);
++    metalfx_signal_semaphore = VK_NULL_HANDLE;
++  }
++  metalfx_format = VK_FORMAT_UNDEFINED;
++  metalfx_extent = {};
++}
++
++// MTLPixelFormat values (stable Apple ABI) accepted by MTLFXSpatialScaler.
++static uint32_t Theft4MetalFXPixelFormat(VkFormat format) {
++  switch (format) {
++    case VK_FORMAT_B8G8R8A8_UNORM:
++      return 80;  // MTLPixelFormatBGRA8Unorm
++    case VK_FORMAT_B8G8R8A8_SRGB:
++      return 81;  // MTLPixelFormatBGRA8Unorm_sRGB
++    case VK_FORMAT_R16G16B16A16_SFLOAT:
++      return 115;  // MTLPixelFormatRGBA16Float
++    default:
++      return 0;  // MTLPixelFormatInvalid
++  }
++}
++
++bool VulkanPresenter::PaintContext::EnsureMetalFXTarget(uint32_t width, uint32_t height,
++                                                         VkFormat format) {
++  const VulkanDevice::Functions& dfn = vulkan_device->functions();
++  const VkDevice device = vulkan_device->device();
++  if (metalfx_image != VK_NULL_HANDLE && metalfx_format == format &&
++      metalfx_extent.width == width && metalfx_extent.height == height &&
++      metalfx_signal_semaphore != VK_NULL_HANDLE) {
++    return true;
++  }
++  DestroyMetalFXTarget();
++  if (!width || !height || format == VK_FORMAT_UNDEFINED) {
++    return false;
++  }
++  VkImageCreateInfo image_create_info;
++  image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++  image_create_info.pNext = nullptr;
++  image_create_info.flags = 0;
++  image_create_info.imageType = VK_IMAGE_TYPE_2D;
++  image_create_info.format = format;
++  image_create_info.extent.width = width;
++  image_create_info.extent.height = height;
++  image_create_info.extent.depth = 1;
++  image_create_info.mipLevels = 1;
++  image_create_info.arrayLayers = 1;
++  image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
++  image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
++  image_create_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
++                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++  image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++  image_create_info.queueFamilyIndexCount = 0;
++  image_create_info.pQueueFamilyIndices = nullptr;
++  image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++  if (!ui::vulkan::util::CreateDedicatedAllocationImage(
++          vulkan_device, image_create_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal,
++          metalfx_image, metalfx_memory)) {
++    REXLOG_ERROR("Theft4 MetalFX: failed to create the offscreen target image");
++    return false;
++  }
++  VkImageViewCreateInfo image_view_create_info;
++  image_view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
++  image_view_create_info.pNext = nullptr;
++  image_view_create_info.flags = 0;
++  image_view_create_info.image = metalfx_image;
++  image_view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
++  image_view_create_info.format = format;
++  image_view_create_info.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
++  image_view_create_info.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
++  image_view_create_info.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
++  image_view_create_info.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
++  image_view_create_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++  image_view_create_info.subresourceRange.baseMipLevel = 0;
++  image_view_create_info.subresourceRange.levelCount = 1;
++  image_view_create_info.subresourceRange.baseArrayLayer = 0;
++  image_view_create_info.subresourceRange.layerCount = 1;
++  if (dfn.vkCreateImageView(device, &image_view_create_info, nullptr,
++                            &metalfx_view) != VK_SUCCESS) {
++    REXLOG_ERROR("Theft4 MetalFX: failed to create the offscreen target view");
++    DestroyMetalFXTarget();
++    return false;
++  }
++  // The framebuffer reuses the swapchain render pass object: the attachment
++  // format matches the pass (both track the swapchain format), and Vulkan
++  // render-pass compatibility depends on format/sample counts, not extents.
++  VkFramebufferCreateInfo framebuffer_create_info;
++  framebuffer_create_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
++  framebuffer_create_info.pNext = nullptr;
++  framebuffer_create_info.flags = 0;
++  framebuffer_create_info.renderPass = swapchain_render_pass;
++  framebuffer_create_info.attachmentCount = 1;
++  framebuffer_create_info.pAttachments = &metalfx_view;
++  framebuffer_create_info.width = width;
++  framebuffer_create_info.height = height;
++  framebuffer_create_info.layers = 1;
++  if (dfn.vkCreateFramebuffer(device, &framebuffer_create_info, nullptr,
++                             &metalfx_framebuffer) != VK_SUCCESS) {
++    REXLOG_ERROR("Theft4 MetalFX: failed to create the offscreen framebuffer");
++    DestroyMetalFXTarget();
++    return false;
++  }
++  VkSemaphoreCreateInfo semaphore_create_info;
++  semaphore_create_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
++  semaphore_create_info.pNext = nullptr;
++  semaphore_create_info.flags = 0;
++  if (dfn.vkCreateSemaphore(device, &semaphore_create_info, nullptr,
++                            &metalfx_signal_semaphore) != VK_SUCCESS) {
++    REXLOG_ERROR("Theft4 MetalFX: failed to create the signal semaphore");
++    DestroyMetalFXTarget();
++    return false;
++  }
++  // Load the MoltenVK MTLTexture export entry point once. Called directly
++  // (rather than via the deprecated MoltenVK header): MoltenVK is statically
++  // linked into the app, so the core vkGetInstanceProcAddr symbol resolves
++  // at link time.
++  if (!metalfx_get_mtl_texture) {
++    PfnVkGetMTLTextureMVK proc = reinterpret_cast<PfnVkGetMTLTextureMVK>(
++        vulkan_device->vulkan_instance()->functions().vkGetInstanceProcAddr(
++            vulkan_device->vulkan_instance()->instance(), "vkGetMTLTextureMVK"));
++    if (!proc) {
++      REXLOG_ERROR("Theft4 MetalFX: vkGetMTLTextureMVK is unavailable");
++      DestroyMetalFXTarget();
++      return false;
++    }
++    metalfx_get_mtl_texture = proc;
++  }
++  metalfx_format = format;
++  metalfx_extent.width = width;
++  metalfx_extent.height = height;
++  return true;
++}
++#endif  // REX_PLATFORM_IOS
++
+ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
+   const uint64_t paint_timing_begin = rex::chrono::Clock::QueryHostTickCount();
+   const uint64_t tv_paint_attempt = ++diagnostic_tv_paint_sequence_;
+@@ -2063,6 +2235,56 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+ 
+   VkSemaphore acquire_semaphore = paint_submission.acquire_semaphore();
+   uint32_t swapchain_image_index = UINT32_MAX;
++#if REX_PLATFORM_IOS
++  // THEFT4 LOCAL (non-upstream): MetalFX spatial route selection. Decided
++  // before any swapchain acquire: on this route no swapchain image is
++  // acquired or presented. The Vulkan side paints the guest output at scene
++  // resolution (video_mode_* carries the scene size in this mode) into the
++  // offscreen target, and the iOS bridge upscales and presents via MetalFX.
++  bool metalfx_route = false;
++  uint32_t metalfx_render_width = 0;
++  uint32_t metalfx_render_height = 0;
++  {
++    static std::atomic<bool> logged_metalfx_route{false};
++    const bool metalfx_requested = REXCVAR_GET(present_effect) == "metalfx";
++    if (metalfx_requested) {
++      metalfx_render_width = uint32_t(REXCVAR_GET(video_mode_width));
++      metalfx_render_height = uint32_t(REXCVAR_GET(video_mode_height));
++      const char* metalfx_reject_reason = nullptr;
++      if (paint_context_.swapchain_is_hdr) {
++        metalfx_reject_reason = "HDR swapchain";
++      } else if (execute_ui_drawers) {
++        metalfx_reject_reason = "UI drawers";
++      } else if (!metalfx_render_width || !metalfx_render_height) {
++        metalfx_reject_reason = "invalid scene size";
++      } else if (paint_context_.swapchain_render_pass == VK_NULL_HANDLE ||
++                 paint_context_.swapchain_render_pass_format == VK_FORMAT_UNDEFINED ||
++                 Theft4MetalFXPixelFormat(paint_context_.swapchain_render_pass_format) == 0) {
++        metalfx_reject_reason = "unsupported swapchain format";
++      } else if (!theft4_metalfx_available()) {
++        metalfx_reject_reason = "MetalFX unavailable on this device";
++      } else if (!paint_context_.EnsureMetalFXTarget(metalfx_render_width,
++                                      metalfx_render_height,
++                                      paint_context_.swapchain_render_pass_format)) {
++        metalfx_reject_reason = "offscreen target creation";
++      } else {
++        metalfx_route = true;
++      }
++      if (!logged_metalfx_route.exchange(true)) {
++        if (metalfx_route) {
++          REXLOG_INFO(
++              "Theft4 MetalFX: spatial route active, scene={}x{} drawable={}x{}",
++              metalfx_render_width, metalfx_render_height,
++              paint_context_.swapchain_extent.width, paint_context_.swapchain_extent.height);
++        } else {
++          REXLOG_WARN(
++              "Theft4 MetalFX: requested but unusable ({}); using the standard swapchain path",
++              metalfx_reject_reason ? metalfx_reject_reason : "unknown reason");
++        }
++      }
++    }
++  }
++#endif
+   // An occluded, minimized, or drawable-starved surface must not block this
+   // thread forever. A timeout drops only this paint attempt.
+   const uint64_t acquire_timeout_nanoseconds =
+@@ -2071,7 +2293,15 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+   gpu_flight::Record("present.acquire-begin", uint64_t(uintptr_t(paint_context_.swapchain)),
+                      current_paint_submission_index, tv_trace_provenance.submitted_frame,
+                      uint64_t(uintptr_t(acquire_semaphore)), diagnostic_swapchain_epoch_);
+-  VkResult acquire_result = dfn.vkAcquireNextImageKHR(
++  VkResult acquire_result = VK_SUCCESS;
++#if REX_PLATFORM_IOS
++  if (metalfx_route) {
++    // THEFT4 LOCAL: no swapchain acquire on the MetalFX route. The index is
++    // kept valid defensively; every swapchain-image use below is substituted.
++    swapchain_image_index = 0;
++  } else {
++#endif
++  acquire_result = dfn.vkAcquireNextImageKHR(
+       device, paint_context_.swapchain, acquire_timeout_nanoseconds, acquire_semaphore,
+       VK_NULL_HANDLE, &swapchain_image_index);
+   gpu_flight::Record("present.acquire-end", uint64_t(uintptr_t(paint_context_.swapchain)),
+@@ -2128,6 +2358,9 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+       REXLOG_ERROR("VulkanPresenter: Failed to acquire the swapchain image");
+       return PaintResult::kNotPresented;
+   }
++#if REX_PLATFORM_IOS
++  }  // else (!metalfx_route): swapchain acquire above. THEFT4 LOCAL.
++#endif
+ 
+   // Non-zero extents needed for both the viewport (width must not be zero) and
+   // the guest output rectangle.
+@@ -2223,13 +2456,30 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+       }
+       guest_output_paint_config.SetEffect(GuestOutputPaintConfig::Effect::kBilinear);
+     }
++#endif
++#if REX_PLATFORM_IOS
++    // THEFT4 LOCAL: the Vulkan side of the MetalFX route paints native /
++    // bilinear at scene resolution; the upscale happens in Metal. The
++    // kMetalFx selector must never reach the effect-flow machinery (which
++    // targets the swapchain extent); the paint target override below
++    // retargets the final pass at the offscreen framebuffer instead.
++    if (guest_output_paint_config.GetEffect() ==
++        GuestOutputPaintConfig::Effect::kMetalFx) {
++      guest_output_paint_config.SetEffect(GuestOutputPaintConfig::Effect::kBilinear);
++    }
+ #endif
+     VkExtent2D max_framebuffer_extent =
+         util::GetMax2DFramebufferExtent(vulkan_device_->properties());
+     GuestOutputPaintFlow guest_output_flow = GetGuestOutputPaintFlow(
+-        guest_output_properties, paint_context_.swapchain_extent.width,
+-        paint_context_.swapchain_extent.height, max_framebuffer_extent.width,
+-        max_framebuffer_extent.height, guest_output_paint_config);
++        guest_output_properties,
++#if REX_PLATFORM_IOS
++        metalfx_route ? metalfx_render_width : paint_context_.swapchain_extent.width,
++        metalfx_route ? metalfx_render_height : paint_context_.swapchain_extent.height,
++#else
++        paint_context_.swapchain_extent.width, paint_context_.swapchain_extent.height,
++#endif
++        max_framebuffer_extent.width, max_framebuffer_extent.height,
++        guest_output_paint_config);
+     guest_output_effect_count = guest_output_flow.effect_count;
+ #if REX_PLATFORM_IOS && defined(REX_HAS_FIDELITYFX_FSR1)
+     // One startup witness of the selected passes and actual extents, rather
+@@ -2252,6 +2502,19 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+                   guest_output_effect_count, easu, rcas);
+       ios_output_route_logged_ = true;
+     }
++#endif
++#if REX_PLATFORM_IOS
++    if (metalfx_route) {
++      // THEFT4 LOCAL: retarget the final pass at the offscreen MetalFX
++      // target (same render pass object: the attachment format matches the
++      // pass, and render-pass compatibility ignores extents). This single
++      // patch covers both the effect final pass and the black-fallback begin
++      // below; the fallback submit/present is skipped separately when no
++      // guest output was recorded.
++      swapchain_render_pass_begin_info.framebuffer = paint_context_.metalfx_framebuffer;
++      swapchain_render_pass_begin_info.renderArea.extent.width = metalfx_render_width;
++      swapchain_render_pass_begin_info.renderArea.extent.height = metalfx_render_height;
++    }
+ #endif
+     if (frame_probe.valid() && guest_output_flow.effect_count) {
+       const size_t last = guest_output_flow.effect_count - 1;
+@@ -2484,7 +2747,15 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+           GuestOutputPaintEffect effect = guest_output_flow.effects[i];
+ 
+           std::pair<uint32_t, uint32_t> effect_rect_size = guest_output_flow.effect_output_sizes[i];
+-          if (is_final_effect && guest_output_flow.output_x == 0 &&
++#if REX_PLATFORM_IOS
++          // THEFT4 LOCAL: on the MetalFX route the flow intentionally targets
++          // the scene-sized offscreen target, so the swapchain-size expansion
++          // below must not fire.
++          const bool metalfx_no_expand = metalfx_route;
++#else
++          const bool metalfx_no_expand = false;
++#endif
++          if (is_final_effect && !metalfx_no_expand && guest_output_flow.output_x == 0 &&
+               guest_output_flow.output_y == 0 &&
+               effect_rect_size.first < paint_context_.swapchain_extent.width &&
+               effect_rect_size.second < paint_context_.swapchain_extent.height) {
+@@ -2567,10 +2838,22 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+             dfn.vkCmdBeginRenderPass(draw_command_buffer, &swapchain_render_pass_begin_info,
+                                      VK_SUBPASS_CONTENTS_INLINE);
+             swapchain_image_pass_begun = true;
++#if REX_PLATFORM_IOS
++            // THEFT4 LOCAL: the MetalFX offscreen target is scene-sized.
++            const uint32_t metalfx_viewport_w =
++                metalfx_route ? metalfx_render_width : paint_context_.swapchain_extent.width;
++            const uint32_t metalfx_viewport_h =
++                metalfx_route ? metalfx_render_height : paint_context_.swapchain_extent.height;
++            guest_output_viewport.width = float(metalfx_viewport_w);
++            guest_output_viewport.height = float(metalfx_viewport_h);
++            guest_output_scissor.extent.width = metalfx_viewport_w;
++            guest_output_scissor.extent.height = metalfx_viewport_h;
++#else
+             guest_output_viewport.width = float(paint_context_.swapchain_extent.width);
+             guest_output_viewport.height = float(paint_context_.swapchain_extent.height);
+             guest_output_scissor.extent.width = paint_context_.swapchain_extent.width;
+             guest_output_scissor.extent.height = paint_context_.swapchain_extent.height;
++#endif
+           } else {
+             effect_rect_x = 0;
+             effect_rect_y = 0;
+@@ -2738,6 +3021,14 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+   // needed, to draw the UI.
+   const bool guest_output_pass_recorded = swapchain_image_pass_begun;
+   const bool full_black_fallback_recorded = !swapchain_image_pass_begun;
++#if REX_PLATFORM_IOS
++  if (metalfx_route && !swapchain_image_pass_begun) {
++    // THEFT4 LOCAL: no guest content was recorded and no swapchain image was
++    // acquired, so there is nothing to upscale or present. The command pool
++    // reset reclaims the recording buffer (see the vkBeginCommandBuffer note).
++    return PaintResult::kNotPresented;
++  }
++#endif
+   if (!swapchain_image_pass_begun) {
+     dfn.vkCmdBeginRenderPass(draw_command_buffer, &swapchain_render_pass_begin_info,
+                              VK_SUBPASS_CONTENTS_INLINE);
+@@ -2906,14 +3197,31 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+   // A render-finished semaphore is owned by the acquired swapchain image, not
+   // by the CPU frame slot. Reacquisition is the WSI guarantee that the prior
+   // present operation for this image has consumed its semaphore wait.
++#if REX_PLATFORM_IOS
++  // THEFT4 LOCAL: on the MetalFX route nothing was acquired; signal the
++  // dedicated offscreen semaphore instead.
++  VkSemaphore present_semaphore =
++      metalfx_route
++          ? paint_context_.metalfx_signal_semaphore
++          : paint_context_.swapchain_framebuffers[swapchain_image_index].present_semaphore;
++#else
+   VkSemaphore present_semaphore =
+       paint_context_.swapchain_framebuffers[swapchain_image_index].present_semaphore;
++#endif
+   VkSubmitInfo submit_info;
+   submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+   submit_info.pNext = nullptr;
++#if REX_PLATFORM_IOS
++  // THEFT4 LOCAL: waiting on the acquire semaphore without an acquire would
++  // wedge the GPU; the MetalFX fence wait below provides the ordering.
++  submit_info.waitSemaphoreCount = metalfx_route ? 0 : 1;
++  submit_info.pWaitSemaphores = metalfx_route ? nullptr : &acquire_semaphore;
++  submit_info.pWaitDstStageMask = metalfx_route ? nullptr : &acquire_semaphore_wait_stage;
++#else
+   submit_info.waitSemaphoreCount = 1;
+   submit_info.pWaitSemaphores = &acquire_semaphore;
+   submit_info.pWaitDstStageMask = &acquire_semaphore_wait_stage;
++#endif
+   submit_info.commandBufferCount = command_buffer_count;
+   submit_info.pCommandBuffers = command_buffers;
+   submit_info.signalSemaphoreCount = 1;
+@@ -3000,6 +3308,43 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+     }
+   }
+ 
++#if REX_PLATFORM_IOS
++  if (metalfx_route) {
++    // THEFT4 LOCAL: the paint above rendered into the offscreen target at
++    // scene resolution. Order the Metal upscale after it with a bounded CPU
++    // fence wait (correctness first; a timeline-semaphore handoff can remove
++    // the bubble later), export the MTLTexture, upscale and present the
++    // drawable. No vkQueuePresent runs on this route.
++    constexpr uint64_t kMetalFXFenceWaitNanoseconds = 1000000000ull;
++    const bool metalfx_gpu_done = paint_context_.submission_tracker.AwaitSubmissionCompletion(
++        current_paint_submission_index, kMetalFXFenceWaitNanoseconds);
++    paint_context_.metalfx_last_submission = current_paint_submission_index;
++    void* metalfx_mtl_texture = nullptr;
++    if (metalfx_gpu_done && paint_context_.metalfx_get_mtl_texture) {
++      paint_context_.metalfx_get_mtl_texture(paint_context_.metalfx_image,
++                                             &metalfx_mtl_texture);
++    }
++    bool metalfx_presented = false;
++    if (metalfx_mtl_texture) {
++      metalfx_presented = theft4_metalfx_upscale_present(
++          metalfx_mtl_texture, Theft4MetalFXPixelFormat(paint_context_.metalfx_format),
++          metalfx_render_width, metalfx_render_height,
++          paint_context_.swapchain_extent.width, paint_context_.swapchain_extent.height);
++    } else if (metalfx_gpu_done) {
++      REXLOG_ERROR("Theft4 MetalFX: MTLTexture export failed");
++    }
++    static uint64_t theft4_metalfx_present_count = 0;
++    ++theft4_metalfx_present_count;
++    if (theft4_metalfx_present_count <= 8 || theft4_metalfx_present_count % 300 == 0) {
++      REXLOG_INFO("[Theft4MetalFX] present={} scene={}x{} drawable={}x{} presented={}",
++                  theft4_metalfx_present_count, metalfx_render_width, metalfx_render_height,
++                  paint_context_.swapchain_extent.width,
++                  paint_context_.swapchain_extent.height, metalfx_presented);
++    }
++    return metalfx_presented ? PaintResult::kPresented : PaintResult::kNotPresented;
++  }
++#endif
++
+   if (swapchain_probe_recorded) {
+     swapchain_probe.pending = true;
+     swapchain_probe.provenance = frame_probe_selected ? guest_output_properties.provenance : tv_trace_provenance;
+Submodule glue/rexglue-sdk-main/thirdparty/FFmpeg contains modified content
+diff --git a/glue/rexglue-sdk-main/thirdparty/FFmpeg/config.h b/glue/rexglue-sdk-main/thirdparty/FFmpeg/config.h
+index b6a504a..657bc79 100644
+--- a/glue/rexglue-sdk-main/thirdparty/FFmpeg/config.h
++++ b/glue/rexglue-sdk-main/thirdparty/FFmpeg/config.h
+@@ -10,6 +10,12 @@
+ #else
+ #include "config_macos_x86_64.h"
+ #endif
++#elif defined(__ORBIS__)
++/* PS4 (OpenOrbis musl) — C-library math/stdlib surface matches Linux closely
++ * enough that config_linux_x86_64.h works as a drop-in. Without this branch,
++ * no HAVE_* macros are defined and libavutil/libm.h emits static fallbacks
++ * for roundf/trunc/truncf that conflict with the SDK's math.h declarations. */
++#include "config_linux_x86_64.h"
+ #elif defined(__gnu_linux__)
+ #if defined(__aarch64__)
+ #include "config_linux_aarch64.h"
+diff --git a/ios/CMakeLists.txt b/ios/CMakeLists.txt
+index 1bc153e5..9104d4d1 100644
+--- a/ios/CMakeLists.txt
++++ b/ios/CMakeLists.txt
+@@ -259,6 +259,7 @@ if(THEFT4_ENABLE_GAME_STARTUP)
+         bridge/theft4_startup.cpp
+         bridge/theft4_bootstrap_graphics.cpp
+         bridge/theft4_metal_presenter.mm
++        bridge/theft4_metalfx_spatial.mm
+         bridge/theft4_bootstrap_audio.cpp
+         bridge/theft4_ios_audio_output.mm
+         bridge/theft4_ios_audio_hotpaths.cpp
+@@ -328,6 +329,8 @@ if(THEFT4_ENABLE_GAME_STARTUP)
+         "${CMAKE_SOURCE_DIR}/glue/rexglue-sdk-main/src/graphics/vulkan/texture_cache.cpp")
+     set_source_files_properties(bridge/theft4_metal_presenter.mm
+         PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
++    set_source_files_properties(bridge/theft4_metalfx_spatial.mm
++        PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+     set_source_files_properties(bridge/theft4_ios_audio_output.mm
+         PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+     set_source_files_properties(bridge/theft4_ios_audio_hotpaths.cpp
+@@ -413,7 +416,7 @@ set_source_files_properties(Theft4/XeniOS-Touch-LICENSE.txt PROPERTIES
+ set_source_files_properties("${THEFT4_ASSET_CATALOG}" PROPERTIES
+     MACOSX_PACKAGE_LOCATION Resources)
+ target_link_libraries(Theft4 PRIVATE theft4_core_bridge
+-    "-framework UIKit" "-framework Metal" "-framework QuartzCore" "-framework SceneKit" "-framework CoreGraphics"
++    "-framework UIKit" "-framework Metal" "-framework MetalFX" "-framework QuartzCore" "-framework SceneKit" "-framework CoreGraphics"
+     "-framework GameController" "-framework CoreHaptics"
+     "-framework AVFoundation" "-framework AudioToolbox")
+ target_link_options(Theft4 PRIVATE "LINKER:-dead_strip")
+diff --git a/ios/Theft4/Theft4LauncherView.h b/ios/Theft4/Theft4LauncherView.h
+index 64fe82cf..6283b7cf 100644
+--- a/ios/Theft4/Theft4LauncherView.h
++++ b/ios/Theft4/Theft4LauncherView.h
+@@ -15,6 +15,7 @@
+ @property(nonatomic, readonly) UISwitch *fsrBoost;
+ @property(nonatomic, readonly) UISegmentedControl *renderResolution;
+ @property(nonatomic, readonly) UISwitch *fsrUpscaling;
++@property(nonatomic, readonly) UISwitch *metalfxUpscaling;
+ @property(nonatomic, readonly) uint32_t renderHeight;
+ @property(nonatomic, readonly) UISwitch *motionBlur;
+ @property(nonatomic, readonly) UIButton *lowPowerButton;
+diff --git a/ios/Theft4/Theft4LauncherView.m b/ios/Theft4/Theft4LauncherView.m
+index 4be9e2db..a60fb9bf 100644
+--- a/ios/Theft4/Theft4LauncherView.m
++++ b/ios/Theft4/Theft4LauncherView.m
+@@ -230,6 +230,9 @@ - (instancetype)initWithFrame:(CGRect)frame {
+         _fsrUpscaling = [UISwitch new];
+         _fsrUpscaling.onTintColor = Ink(0xB6884D);
+         _fsrUpscaling.accessibilityIdentifier = @"settings.fsrUpscaling";
++        _metalfxUpscaling = [UISwitch new];
++        _metalfxUpscaling.onTintColor = Ink(0xB6884D);
++        _metalfxUpscaling.accessibilityIdentifier = @"settings.metalfxUpscaling";
+         _resolutionSummary = Copy(@"", 12, YES);
+         _resolutionSummary.accessibilityIdentifier = @"settings.resolutionSummary";
+         [graphicsRows addObjectsFromArray:@[
+@@ -239,6 +242,9 @@ - (instancetype)initWithFrame:(CGRect)frame {
+                     ? @"A19: 540p, 720p and 900p upscale to 1080p; 1080p renders natively."
+                     : @"Fit the selected internal resolution to the display with spatial upscaling.")
+                 toggle:_fsrUpscaling],
++            [self setting:@"METALFX SPATIAL" detail:
++                @"Apple-tuned spatial upscale instead of FSR 1 (experimental, mutually exclusive with FSR)."
++                toggle:_metalfxUpscaling],
+             _resolutionSummary
+         ]];
+         _lowPowerButton = Action(@"APPLY PERFORMANCE PRESET", NO);
+@@ -570,14 +576,15 @@ - (void)refreshConfigurationSummary {
+     if (_renderResolution) {
+         UIScreen *screen = self.window.screen ?: UIScreen.mainScreen;
+         const BOOL a19 = strcmp(getenv("THEFT4_DEVICE_PROFILE") ?: "", "a19") == 0;
++        const BOOL metalfx = !a19 && _metalfxUpscaling.on;
+         const theft4_output_policy output = a19
+             ? theft4_output_policy_for_a19_lab(self.renderHeight)
+-            : theft4_output_policy_for_lab(self.renderHeight, _fsrUpscaling.on,
++            : theft4_output_policy_for_lab(self.renderHeight, _fsrUpscaling.on && !metalfx, metalfx,
+                 (uint32_t)floor(self.bounds.size.width * screen.nativeScale),
+                 (uint32_t)floor(self.bounds.size.height * screen.nativeScale));
+         _resolutionSummary.text = [NSString stringWithFormat:@"%u × %u  →  %u × %u\n%@ · NEXT GAME LAUNCH",
+             output.render_width, output.render_height, output.output_width, output.output_height,
+-            output.fsr1 ? @"FSR ON" : @"NATIVE"];
++            output.metalfx ? @"METALFX" : (output.fsr1 ? @"FSR ON" : @"NATIVE")];
+         _configuration.text = [NSString stringWithFormat:@"%up / %@ / %@",
+             self.renderHeight, shadow, distance];
+         return;
+diff --git a/ios/Theft4/main.m b/ios/Theft4/main.m
+index 58426711..4918f7d4 100644
+--- a/ios/Theft4/main.m
++++ b/ios/Theft4/main.m
+@@ -274,6 +274,7 @@ - (void)viewDidLoad {
+         @"Theft4AnisotropicFiltering": @(!_legacyIPadProfile),
+         @"Theft4EnhancedOutput1080p": @(!_legacyIPadProfile),
+         @"Theft4ExperimentalFSRBoost": @NO,
++        @"Theft4MetalFXUpscaling": @NO,
+         @"Theft4MotionBlur": @NO,
+         @"Theft4ShadowQuality": @0,
+         @"Theft4DrawDistance": @0,
+@@ -364,11 +365,17 @@ - (void)viewDidLoad {
+         if (![defaults objectForKey:@"Theft4LabFSREnabled"])
+             [defaults setBool:_enhancedOutput.on forKey:@"Theft4LabFSREnabled"];
+         _bringupOverlay.fsrUpscaling.on = [defaults boolForKey:@"Theft4LabFSREnabled"];
++        _bringupOverlay.metalfxUpscaling.on = [defaults boolForKey:@"Theft4MetalFXUpscaling"];
++        // The upscalers are mutually exclusive; a legacy persisted state
++        // must never enable both (FSR keeps the historical behavior).
++        if (_bringupOverlay.fsrUpscaling.on) _bringupOverlay.metalfxUpscaling.on = NO;
+         [self syncA19OutputChoice];
+         [_bringupOverlay.renderResolution addTarget:self action:@selector(displaySettingsChanged:)
+             forControlEvents:UIControlEventValueChanged];
+         [_bringupOverlay.fsrUpscaling addTarget:self action:@selector(displaySettingsChanged:)
+             forControlEvents:UIControlEventValueChanged];
++        [_bringupOverlay.metalfxUpscaling addTarget:self action:@selector(displaySettingsChanged:)
++            forControlEvents:UIControlEventValueChanged];
+     }
+     // Older installs may have M-series defaults persisted. Start pre-M iPads
+     // in a conservative mode on every process launch, while still allowing an
+@@ -895,6 +902,13 @@ - (void)displaySettingsChanged:(UIControl *)sender {
+     [self syncA19OutputChoice];
+     if (sender == _fsrBoost && _fsrBoost.on) _enhancedOutput.on = YES;
+     if (sender == _enhancedOutput && !_enhancedOutput.on) _fsrBoost.on = NO;
++    // FSR and MetalFX upscaling are mutually exclusive; last switch wins.
++    if (_bringupOverlay.renderResolution) {
++        if (sender == _bringupOverlay.fsrUpscaling && _bringupOverlay.fsrUpscaling.on)
++            _bringupOverlay.metalfxUpscaling.on = NO;
++        if (sender == _bringupOverlay.metalfxUpscaling && _bringupOverlay.metalfxUpscaling.on)
++            _bringupOverlay.fsrUpscaling.on = NO;
++    }
+     [NSUserDefaults.standardUserDefaults setBool:_performanceCapture.on
+                                           forKey:@"Theft4DetailedPerformanceCapture"];
+     [NSUserDefaults.standardUserDefaults setBool:_fsrBoost.on forKey:@"Theft4ExperimentalFSRBoost"];
+@@ -908,6 +922,7 @@ - (void)displaySettingsChanged:(UIControl *)sender {
+     if (_bringupOverlay.renderResolution) {
+         [NSUserDefaults.standardUserDefaults setInteger:_bringupOverlay.renderHeight forKey:@"Theft4LabRenderHeight"];
+         [NSUserDefaults.standardUserDefaults setBool:_bringupOverlay.fsrUpscaling.on forKey:@"Theft4LabFSREnabled"];
++        [NSUserDefaults.standardUserDefaults setBool:_bringupOverlay.metalfxUpscaling.on forKey:@"Theft4MetalFXUpscaling"];
+     }
+     [_bringupOverlay refreshConfigurationSummary];
+     [NSUserDefaults.standardUserDefaults setBool:_showFPS.on forKey:@"Theft4ShowFPS"];
+@@ -929,12 +944,16 @@ - (void)syncA19OutputChoice {
+         strcmp(getenv("THEFT4_DEVICE_PROFILE") ?: "", "a19") != 0) return;
+     _bringupOverlay.fsrUpscaling.on = _bringupOverlay.renderHeight < 1080;
+     _bringupOverlay.fsrUpscaling.enabled = NO;
++    // The A19 profile keeps the validated FSR route; MetalFX stays off here.
++    _bringupOverlay.metalfxUpscaling.on = NO;
++    _bringupOverlay.metalfxUpscaling.enabled = NO;
+ }
+ 
+ - (void)applyLowPowerPreset {
+     if (!_bringupOverlay.renderResolution || _executionAttempted) return;
+     _bringupOverlay.renderResolution.selectedSegmentIndex = 0;
+     _bringupOverlay.fsrUpscaling.on = YES;
++    _bringupOverlay.metalfxUpscaling.on = NO;
+     for (UISegmentedControl *choice in @[_shadowQuality, _drawDistance, _modelDetail,
+                                           _reflectionQuality, _antiAliasing])
+         choice.selectedSegmentIndex = 0;
+@@ -1304,9 +1323,14 @@ - (void)startGamePreparation:(NSURL *)game execute:(BOOL)execute {
+         const uint32_t nativeWidth = (uint32_t)floor(_metalView.bounds.size.width * nativeScale);
+         const uint32_t nativeHeight = (uint32_t)floor(_metalView.bounds.size.height * nativeScale);
+         if (_bringupOverlay.renderResolution) {
++            const BOOL a19Profile =
++                strcmp(getenv("THEFT4_DEVICE_PROFILE") ?: "", "a19") == 0;
++            // Mutual exclusion is enforced in the UI; FSR wins defensively.
++            const BOOL metalfx = !a19Profile && _bringupOverlay.metalfxUpscaling.on &&
++                !_bringupOverlay.fsrUpscaling.on;
+             theft4_metal_set_lab_output(_bringupOverlay.renderHeight,
+-                _bringupOverlay.fsrUpscaling.on, nativeWidth, nativeHeight,
+-                strcmp(getenv("THEFT4_DEVICE_PROFILE") ?: "", "a19") == 0);
++                _bringupOverlay.fsrUpscaling.on, metalfx, nativeWidth, nativeHeight,
++                a19Profile);
+         } else {
+             theft4_metal_set_output_mode(
+                 _fsrBoost.on ? THEFT4_OUTPUT_FSR_BOOST :
+@@ -1318,6 +1342,7 @@ - (void)startGamePreparation:(NSURL *)game execute:(BOOL)execute {
+         _fsrBoost.enabled = NO;
+         _bringupOverlay.renderResolution.enabled = NO;
+         _bringupOverlay.fsrUpscaling.enabled = NO;
++        _bringupOverlay.metalfxUpscaling.enabled = NO;
+         _bringupOverlay.restartButton.enabled = NO;
+         _enhancedOutput.enabled = NO;
+         _anisotropicFiltering.enabled = NO;
+diff --git a/ios/bridge/theft4_gta4_native_graphics.cpp b/ios/bridge/theft4_gta4_native_graphics.cpp
+index 9ac699e2..89995fa0 100644
+--- a/ios/bridge/theft4_gta4_native_graphics.cpp
++++ b/ios/bridge/theft4_gta4_native_graphics.cpp
+@@ -96,7 +96,7 @@ REXCVAR_DEFINE_STRING(gta4_native_smaa_quality, "high",
+     .allowed({"low", "medium", "high", "ultra"});
+ REXCVAR_DEFINE_STRING(gta4_native_upscaler, "native", "GTA IV/Graphics/Upscaling",
+                       "Output upscaler")
+-    .allowed({"native", "fsr1"})
++    .allowed({"native", "fsr1", "metalfx"})
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ REXCVAR_DEFINE_STRING(gta4_fsr1_quality, "quality", "GTA IV/Graphics/Upscaling",
+                       "FSR 1 quality")
+diff --git a/ios/bridge/theft4_metal_presenter.h b/ios/bridge/theft4_metal_presenter.h
+index 0f86a877..5c55a10f 100644
+--- a/ios/bridge/theft4_metal_presenter.h
++++ b/ios/bridge/theft4_metal_presenter.h
+@@ -16,9 +16,9 @@ void theft4_metal_unbind_layer(void* layer);
+ // subsequent UIKit layout keeps this size rather than reverting to 720p.
+ void theft4_metal_set_output_mode(theft4_output_mode mode,
+                                   uint32_t native_width, uint32_t native_height);
+-void theft4_metal_set_lab_output(uint32_t render_height, bool fsr1,
+-                                uint32_t native_width, uint32_t native_height,
+-                                bool a19_profile);
++void theft4_metal_set_lab_output(uint32_t render_height, bool fsr1, bool metalfx,
++                                 uint32_t native_width, uint32_t native_height,
++                                 bool a19_profile);
+ theft4_output_policy theft4_metal_get_output_policy(void);
+ void theft4_metal_resize_layer(void* layer, double width, double height,
+                                double scale);
+diff --git a/ios/bridge/theft4_metal_presenter.mm b/ios/bridge/theft4_metal_presenter.mm
+index bb3d3c93..a58f35db 100644
+--- a/ios/bridge/theft4_metal_presenter.mm
++++ b/ios/bridge/theft4_metal_presenter.mm
+@@ -101,12 +101,12 @@ void theft4_metal_set_output_mode(theft4_output_mode mode,
+   SetOutputPolicy(theft4_output_policy_for_mode(mode, native_width, native_height));
+ }
+ 
+-void theft4_metal_set_lab_output(uint32_t render_height, bool fsr1,
+-                                uint32_t native_width, uint32_t native_height,
+-                                bool a19_profile) {
++void theft4_metal_set_lab_output(uint32_t render_height, bool fsr1, bool metalfx,
++                                 uint32_t native_width, uint32_t native_height,
++                                 bool a19_profile) {
+   SetOutputPolicy(a19_profile
+       ? theft4_output_policy_for_a19_lab(render_height)
+-      : theft4_output_policy_for_lab(render_height, fsr1, native_width, native_height));
++      : theft4_output_policy_for_lab(render_height, fsr1, metalfx, native_width, native_height));
+ }
+ 
+ theft4_output_policy theft4_metal_get_output_policy(void) {
+diff --git a/ios/bridge/theft4_metalfx_spatial.h b/ios/bridge/theft4_metalfx_spatial.h
+new file mode 100644
+index 00000000..c835f181
+--- /dev/null
++++ b/ios/bridge/theft4_metalfx_spatial.h
+@@ -0,0 +1,28 @@
++#pragma once
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Apple MetalFX spatial upscaler for the iOS present path (Theft4 local,
++// non-upstream). True when an MTLFXSpatialScaler can be created on this
++// device; the result is cached. Simulator and older runtimes report false.
++bool theft4_metalfx_available(void);
++
++// Upscales the borrowed input MTLTexture (owned by MoltenVK, already
++// GPU-complete: the caller waited on the Vulkan paint fence) from
++// input_width x input_height to output_width x output_height and presents
++// the result on the bound CAMetalLayer. input_pixel_format is the
++// MTLPixelFormat value (BGRA8Unorm or RGBA16Float); anything else is
++// rejected. Returns false on any failure; the caller then drops the frame
++// and the next paint is retried.
++bool theft4_metalfx_upscale_present(void* input_texture, uint32_t input_pixel_format,
++                                    uint32_t input_width, uint32_t input_height,
++                                    uint32_t output_width, uint32_t output_height);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/ios/bridge/theft4_metalfx_spatial.mm b/ios/bridge/theft4_metalfx_spatial.mm
+new file mode 100644
+index 00000000..bc3885a8
+--- /dev/null
++++ b/ios/bridge/theft4_metalfx_spatial.mm
+@@ -0,0 +1,189 @@
++// Apple MetalFX spatial upscaler (Theft4 local, non-upstream).
++//
++// Alternative to the in-Vulkan FSR1 upscale: the Vulkan presenter renders the
++// guest output at scene resolution into an offscreen image, exports the
++// underlying MTLTexture, and this module upscales it to the drawable size
++// with MTLFXSpatialScaler before presenting. The caller guarantees the input
++// texture is GPU-complete (Vulkan paint fence waited on the CPU side), so no
++// cross-API event plumbing is needed for correctness here.
++//
++// Ordering note: this runs on the render-worker paint thread, never on the
++// main thread. All Metal objects are created lazily and guarded by a lock.
++
++#import <Metal/Metal.h>
++#import <MetalFX/MetalFX.h>
++#import <QuartzCore/CAMetalLayer.h>
++#import <os/lock.h>
++
++#include "theft4_metalfx_spatial.h"
++
++#include "theft4_metal_presenter.h"
++
++namespace {
++
++// The Vulkan offscreen target uses the swapchain format (BGRA8Unorm, sRGB
++// variant on some configurations, or RGBA16Float for HDR-class content).
++// All three are in the MTLFXSpatialScaler supported input set.
++constexpr MTLPixelFormat kMetalFxOutputFormat = MTLPixelFormatBGRA8Unorm;
++
++bool MetalFxInputFormatSupported(uint32_t pixel_format) {
++  return pixel_format == MTLPixelFormatBGRA8Unorm ||
++         pixel_format == MTLPixelFormatBGRA8Unorm_sRGB ||
++         pixel_format == MTLPixelFormatRGBA16Float;
++}
++
++os_unfair_lock metalfx_lock = OS_UNFAIR_LOCK_INIT;
++id<MTLDevice> metalfx_device = nil;
++id<MTLCommandQueue> metalfx_queue = nil;
++id<MTLFXSpatialScaler> metalfx_scaler = nil;
++uint32_t metalfx_in_format = 0;
++uint32_t metalfx_in_w = 0;
++uint32_t metalfx_in_h = 0;
++uint32_t metalfx_out_w = 0;
++uint32_t metalfx_out_h = 0;
++id<MTLTexture> metalfx_output_texture = nil;
++bool metalfx_probed = false;
++bool metalfx_supported = false;
++
++bool EnsureDeviceLocked() {
++  if (!metalfx_device) metalfx_device = MTLCreateSystemDefaultDevice();
++  if (metalfx_device && !metalfx_queue) {
++    metalfx_queue = [metalfx_device newCommandQueue];
++    metalfx_queue.label = @"Theft4 MetalFX Queue";
++  }
++  return metalfx_device && metalfx_queue;
++}
++
++bool EnsureScalerLocked(uint32_t in_format, uint32_t in_w, uint32_t in_h,
++                        uint32_t out_w, uint32_t out_h) {
++  if (!EnsureDeviceLocked()) return false;
++  if (metalfx_scaler && metalfx_output_texture && metalfx_in_format == in_format &&
++      metalfx_in_w == in_w && metalfx_in_h == in_h && metalfx_out_w == out_w &&
++      metalfx_out_h == out_h) {
++    return true;
++  }
++  if (@available(iOS 16.0, *)) {
++    MTLFXSpatialScalerDescriptor* desc = [MTLFXSpatialScalerDescriptor new];
++    desc.inputWidth = in_w;
++    desc.inputHeight = in_h;
++    desc.outputWidth = out_w;
++    desc.outputHeight = out_h;
++    desc.colorTextureFormat = (MTLPixelFormat)in_format;
++    desc.outputTextureFormat = kMetalFxOutputFormat;
++    id<MTLFXSpatialScaler> scaler = [desc newSpatialScalerWithDevice:metalfx_device];
++    if (!scaler) return false;
++    // Honor the scaler's minimum usage bits, plus shader-read for the
++    // drawable blit below.
++    MTLTextureDescriptor* out_desc = [MTLTextureDescriptor
++        texture2DDescriptorWithPixelFormat:kMetalFxOutputFormat
++                                     width:out_w
++                                    height:out_h
++                                 mipmapped:NO];
++    out_desc.usage = scaler.outputTextureUsage | MTLTextureUsageShaderRead;
++    out_desc.storageMode = MTLStorageModePrivate;
++    id<MTLTexture> output = [metalfx_device newTextureWithDescriptor:out_desc];
++    if (!output) return false;
++    metalfx_scaler = scaler;
++    metalfx_output_texture = output;
++    metalfx_in_format = in_format;
++    metalfx_in_w = in_w;
++    metalfx_in_h = in_h;
++    metalfx_out_w = out_w;
++    metalfx_out_h = out_h;
++    return true;
++  }
++  return false;
++}
++
++}  // namespace
++
++bool theft4_metalfx_available(void) {
++  @autoreleasepool {
++    os_unfair_lock_lock(&metalfx_lock);
++    if (!metalfx_probed) {
++      metalfx_probed = true;
++      // No scaler is created for the probe: the descriptor answers support
++      // directly (simulator and older GPUs report NO).
++      if (@available(iOS 16.0, *)) {
++        metalfx_supported =
++            EnsureDeviceLocked() && [MTLFXSpatialScalerDescriptor supportsDevice:metalfx_device];
++      } else {
++        metalfx_supported = false;
++      }
++    }
++    const bool supported = metalfx_supported;
++    os_unfair_lock_unlock(&metalfx_lock);
++    return supported;
++  }
++}
++
++bool theft4_metalfx_upscale_present(void* input_texture, uint32_t input_pixel_format,
++                                    uint32_t input_width, uint32_t input_height,
++                                    uint32_t output_width, uint32_t output_height) {
++  @autoreleasepool {
++    if (!input_texture || !input_width || !input_height || !output_width || !output_height ||
++        !MetalFxInputFormatSupported(input_pixel_format)) {
++      return false;
++    }
++    // The bound layer pointer is guarded by the presenter lock; fetch it
++    // before taking the MetalFX lock to keep a single lock order.
++    CAMetalLayer* layer = (__bridge CAMetalLayer*)theft4_metal_bound_layer();
++    if (!layer) {
++      return false;
++    }
++    os_unfair_lock_lock(&metalfx_lock);
++    id<MTLCommandQueue> queue = metalfx_queue;
++    if (!queue || !EnsureScalerLocked(input_pixel_format, input_width, input_height, output_width,
++                                      output_height)) {
++      os_unfair_lock_unlock(&metalfx_lock);
++      return false;
++    }
++    id<CAMetalDrawable> drawable = [layer nextDrawable];
++    if (!drawable || drawable.texture.width != output_width ||
++        drawable.texture.height != output_height) {
++      // Drawable resized mid-flight (rotation, window change): drop this
++      // frame; the layer size latch and scaler reconfigure on retry.
++      os_unfair_lock_unlock(&metalfx_lock);
++      return false;
++    }
++    id<MTLTexture> input = (__bridge id<MTLTexture>)input_texture;
++    id<MTLCommandBuffer> buffer = [queue commandBuffer];
++    if (!buffer) {
++      os_unfair_lock_unlock(&metalfx_lock);
++      return false;
++    }
++    if (@available(iOS 16.0, *)) {
++      // Modern MetalFX API: textures ride as properties, then a single
++      // encode call. The descriptor's perceptual processing matches the
++      // normalized guest output the FSR path consumes.
++      metalfx_scaler.colorTexture = input;
++      metalfx_scaler.inputContentWidth = input_width;
++      metalfx_scaler.inputContentHeight = input_height;
++      metalfx_scaler.outputTexture = metalfx_output_texture;
++      [metalfx_scaler encodeToCommandBuffer:buffer];
++    } else {
++      os_unfair_lock_unlock(&metalfx_lock);
++      return false;
++    }
++    id<MTLBlitCommandEncoder> blit = [buffer blitCommandEncoder];
++    if (!blit) {
++      os_unfair_lock_unlock(&metalfx_lock);
++      return false;
++    }
++    [blit copyFromTexture:metalfx_output_texture
++              sourceSlice:0
++              sourceLevel:0
++             sourceOrigin:MTLOriginMake(0, 0, 0)
++               sourceSize:MTLSizeMake(output_width, output_height, 1)
++                toTexture:drawable.texture
++         destinationSlice:0
++         destinationLevel:0
++        destinationOrigin:MTLOriginMake(0, 0, 0)];
++    [blit endEncoding];
++    [buffer presentDrawable:drawable];
++    [buffer commit];
++    os_unfair_lock_unlock(&metalfx_lock);
++    theft4_frame_counter_note_published();
++    return true;
++  }
++}
+diff --git a/ios/bridge/theft4_output_policy.h b/ios/bridge/theft4_output_policy.h
+index 39f721ec..a7a723c7 100644
+--- a/ios/bridge/theft4_output_policy.h
++++ b/ios/bridge/theft4_output_policy.h
+@@ -17,6 +17,11 @@ typedef struct theft4_output_policy {
+     uint32_t output_width;
+     uint32_t output_height;
+     bool fsr1;
++    // Apple MetalFX spatial upscaler alternative to FSR1. Mutually exclusive
++    // with fsr1: the scene renders at render_* and MetalFX upscales to
++    // output_* at presentation time. Unlike FSR Quality, no 1.5x logical
++    // video scaling applies (video_* equals render_* below).
++    bool metalfx;
+     // Logical game video mode, NOT the physical swapchain size. FSR Quality
+     // hooks divide these by 1.5 to select the internal scene resolution.
+     uint32_t video_width;
+@@ -27,7 +32,7 @@ static inline theft4_output_policy theft4_output_policy_for_mode(
+     theft4_output_mode mode, uint32_t native_width, uint32_t native_height) {
+     const bool enhanced = mode != THEFT4_OUTPUT_720P;
+     theft4_output_policy policy = {
+-        1280, 720, enhanced ? 1920u : 1280u, enhanced ? 1080u : 720u, enhanced,
++        1280, 720, enhanced ? 1920u : 1280u, enhanced ? 1080u : 720u, enhanced, false,
+         enhanced ? 1920u : 1280u, enhanced ? 1080u : 720u
+     };
+     if (mode == THEFT4_OUTPUT_FSR_BOOST) {
+@@ -56,11 +61,13 @@ static inline uint32_t theft4_lab_render_height(uint32_t height) {
+ }
+ 
+ static inline theft4_output_policy theft4_output_policy_for_lab(
+-    uint32_t render_height, bool fsr1, uint32_t native_width, uint32_t native_height) {
++    uint32_t render_height, bool fsr1, bool metalfx,
++    uint32_t native_width, uint32_t native_height) {
+     const uint32_t height = theft4_lab_render_height(render_height);
+     const uint32_t width = height * 16 / 9;
+-    theft4_output_policy policy = {width, height, width, height, fsr1, width, height};
+-    if (fsr1) {
++    theft4_output_policy policy = {width, height, width, height, fsr1, metalfx, width, height};
++    const bool upscale = fsr1 || metalfx;
++    if (upscale) {
+         const theft4_output_policy native_fit = theft4_output_policy_for_mode(
+             THEFT4_OUTPUT_FSR_BOOST, native_width, native_height);
+         policy.output_width = native_fit.output_width;
+@@ -68,16 +75,21 @@ static inline theft4_output_policy theft4_output_policy_for_lab(
+         // The existing native hooks divide the logical video mode by 1.5 for
+         // FSR Quality. This preserves the explicitly selected scene resolution
+         // regardless of the actual drawable size (including small windows).
+-        policy.video_width = width * 3 / 2;
+-        policy.video_height = height * 3 / 2;
++        // MetalFX spatial takes explicit input/output sizes instead, so the
++        // logical video mode stays at the scene resolution.
++        if (fsr1) {
++            policy.video_width = width * 3 / 2;
++            policy.video_height = height * 3 / 2;
++        }
+     }
+     return policy;
+ }
+ 
+ // The A19 phone profile has a fixed 1080p display budget. Lower scene modes
+ // use FSR; selecting 1080p itself bypasses the unnecessary upscale pass.
++// MetalFX is not selected by the A19 profile for now (FSR path unchanged).
+ static inline theft4_output_policy theft4_output_policy_for_a19_lab(
+     uint32_t render_height) {
+     const uint32_t height = theft4_lab_render_height(render_height);
+-    return theft4_output_policy_for_lab(height, height < 1080, 1920, 1080);
++    return theft4_output_policy_for_lab(height, height < 1080, false, 1920, 1080);
+ }
+diff --git a/ios/bridge/theft4_startup.cpp b/ios/bridge/theft4_startup.cpp
+index 5d91ed01..9e46536f 100644
+--- a/ios/bridge/theft4_startup.cpp
++++ b/ios/bridge/theft4_startup.cpp
+@@ -3,6 +3,7 @@
+ #include "theft4_bootstrap_graphics.h"
+ #include "theft4_bootstrap_input.h"
+ #include "theft4_metal_presenter.h"
++#include "theft4_metalfx_spatial.h"
+ #include "theft4_motion_blur.h"
+ #include "gta4_installer.h"
+ #include <rex/image_info.h>
+@@ -181,16 +182,31 @@ int theft4_start_game(const char* game_directory, const char* support_directory,
+         // ratio produces exactly the selected 720p, 900p or 1080p scene.
+         REXCVAR_SET(video_mode_width, int32_t(output.video_width));
+         REXCVAR_SET(video_mode_height, int32_t(output.video_height));
+-        REXCVAR_SET(gta4_native_upscaler, output.fsr1 ? "fsr1" : "native");
++        // MetalFX spatial replaces the in-Vulkan FSR1 upscale with an Apple-
++        // tuned pass at presentation time. When selected but unavailable on
++        // this device (simulator), fall back to native bilinear rather than
++        // failing startup; the route is re-evaluated every launch. FSR wins
++        // defensively if both flags ever arrive set.
++        const bool metalfx_route =
++            output.metalfx && !output.fsr1 && theft4_metalfx_available();
++        if (output.metalfx && !metalfx_route) {
++          REXLOG_WARN("Theft4 MetalFX requested but unavailable on this device; "
++                      "using native bilinear presentation");
++        }
++        const char* upscaler =
++            metalfx_route ? "metalfx" : (output.fsr1 ? "fsr1" : "native");
++        const char* effect =
++            metalfx_route ? "metalfx" : (output.fsr1 ? "fsr" : "bilinear");
++        REXCVAR_SET(gta4_native_upscaler, upscaler);
+         REXCVAR_SET(gta4_fsr1_quality, "quality");
+-        REXCVAR_SET(present_effect, output.fsr1 ? "fsr" : "bilinear");
++        REXCVAR_SET(present_effect, effect);
+         REXCVAR_SET(present_fsr_sharpness_reduction,
+                     REXCVAR_GET(gta4_fsr1_sharpness_reduction));
+         REXLOG_INFO("Theft4 output policy: render={}x{} output={}x{} upscaler={} "
+                     "quality=quality sharpness-reduction={} fps-counter=content-sequence",
+                     output.render_width, output.render_height,
+                     output.output_width, output.output_height,
+-                    output.fsr1 ? "fsr1" : "native",
++                    upscaler,
+                     REXCVAR_GET(present_fsr_sharpness_reduction));
+         // A same-scene iPad A/B showed that forced 8x filtering introduced
+         // visible frame-time instability in heavy views for only a marginal
+diff --git a/ios/tests/lab_resolution_policy_test.cpp b/ios/tests/lab_resolution_policy_test.cpp
+index f15964f1..5570ed12 100644
+--- a/ios/tests/lab_resolution_policy_test.cpp
++++ b/ios/tests/lab_resolution_policy_test.cpp
+@@ -17,9 +17,10 @@ int main() {
+         for (bool fsr : {false, true}) {
+             for (const auto display : {std::pair<unsigned,unsigned>{2420,1668}, {2752,2064},
+                                        {0,0}, {1024,768}, {1668,2420}, {7680,4320}}) {
+-                const auto p = theft4_output_policy_for_lab(scene.second, fsr, display.first, display.second);
++                const auto p = theft4_output_policy_for_lab(scene.second, fsr, false, display.first, display.second);
+                 assert(p.render_width == scene.first && p.render_height == scene.second);
+                 assert(p.fsr1 == fsr);
++                assert(p.metalfx == false);
+                 const auto logical = gta4::aspect::resolution::Select(
+                     {p.video_width,p.video_height}, "16:9", {display.first,display.second});
+                 assert(uint32_t(std::round(logical.width / (fsr ? 1.5 : 1.0))) == scene.first);
+@@ -39,10 +40,21 @@ int main() {
+         }
+     }
+     for (uint32_t invalid : {0u, 1u, 899u, 901u, 2160u, UINT32_MAX}) {
+-        const auto fallback = theft4_output_policy_for_lab(invalid, true, 2420, 1668);
++        const auto fallback = theft4_output_policy_for_lab(invalid, true, false, 2420, 1668);
+         assert(fallback.render_width == 1280 && fallback.render_height == 720);
+     }
+ 
++    // MetalFX spatial: scene resolution preserved, drawable at native fit,
++    // logical video mode equals the scene (no FSR 1.5x scaling).
++    for (const auto scene : {std::pair<unsigned,unsigned>{960,540}, {1280,720}}) {
++        const auto p = theft4_output_policy_for_lab(scene.second, false, true, 1920, 1080);
++        assert(p.render_width == scene.first && p.render_height == scene.second);
++        assert(p.fsr1 == false && p.metalfx == true);
++        assert(p.video_width == scene.first && p.video_height == scene.second);
++        assert(p.output_width == 1920 && p.output_height == 1080);
++        assert(p.output_width * 9 == p.output_height * 16);
++    }
++
+     for (uint32_t height : {540u, 720u, 900u, 1080u}) {
+         const auto p = theft4_output_policy_for_a19_lab(height);
+         assert(p.render_height == height);
+Submodule thirdparty/MoltenVK/MoltenVK contains modified content
+diff --git a/thirdparty/MoltenVK/MoltenVK/MoltenVK/MoltenVK.xcodeproj/project.pbxproj b/thirdparty/MoltenVK/MoltenVK/MoltenVK/MoltenVK.xcodeproj/project.pbxproj
+index 2cfceaa..6d7bbc2 100644
+--- a/thirdparty/MoltenVK/MoltenVK/MoltenVK/MoltenVK.xcodeproj/project.pbxproj
++++ b/thirdparty/MoltenVK/MoltenVK/MoltenVK/MoltenVK.xcodeproj/project.pbxproj
+@@ -98,6 +98,7 @@
+ 		2FEA0A9424902F9F00EEF3AD /* MVKCommandPool.mm in Sources */ = {isa = PBXBuildFile; fileRef = A94FB77B1C7DFB4800632CA3 /* MVKCommandPool.mm */; };
+ 		2FEA0A9524902F9F00EEF3AD /* MVKCmdDraw.mm in Sources */ = {isa = PBXBuildFile; fileRef = A94FB7751C7DFB4800632CA3 /* MVKCmdDraw.mm */; };
+ 		2FEA0A9624902F9F00EEF3AD /* MVKCommandBuffer.mm in Sources */ = {isa = PBXBuildFile; fileRef = A94FB7791C7DFB4800632CA3 /* MVKCommandBuffer.mm */; };
++		868A8C8B88EE4307BB82875F /* MVKMTLBufferRetention.mm in Sources */ = {isa = PBXBuildFile; fileRef = 0034BCF7930D489E98E2669F /* MVKMTLBufferRetention.mm */; };
+ 		2FEA0A9724902F9F00EEF3AD /* MVKCmdRendering.mm in Sources */ = {isa = PBXBuildFile; fileRef = A94FB7731C7DFB4800632CA3 /* MVKCmdRendering.mm */; };
+ 		2FEA0A9824902F9F00EEF3AD /* MVKBuffer.mm in Sources */ = {isa = PBXBuildFile; fileRef = A94FB7801C7DFB4800632CA3 /* MVKBuffer.mm */; };
+ 		2FEA0A9924902F9F00EEF3AD /* mvk_datatypes.mm in Sources */ = {isa = PBXBuildFile; fileRef = A94FB7A91C7DFB4800632CA3 /* mvk_datatypes.mm */; };
+@@ -181,7 +182,9 @@
+ 		A94FB7D01C7DFB4800632CA3 /* MVKCommandBuffer.h in Headers */ = {isa = PBXBuildFile; fileRef = A94FB7781C7DFB4800632CA3 /* MVKCommandBuffer.h */; };
+ 		A94FB7D11C7DFB4800632CA3 /* MVKCommandBuffer.h in Headers */ = {isa = PBXBuildFile; fileRef = A94FB7781C7DFB4800632CA3 /* MVKCommandBuffer.h */; };
+ 		A94FB7D21C7DFB4800632CA3 /* MVKCommandBuffer.mm in Sources */ = {isa = PBXBuildFile; fileRef = A94FB7791C7DFB4800632CA3 /* MVKCommandBuffer.mm */; };
++		B1A9B3F4F5474B6D848EDEFA /* MVKMTLBufferRetention.mm in Sources */ = {isa = PBXBuildFile; fileRef = 0034BCF7930D489E98E2669F /* MVKMTLBufferRetention.mm */; };
+ 		A94FB7D31C7DFB4800632CA3 /* MVKCommandBuffer.mm in Sources */ = {isa = PBXBuildFile; fileRef = A94FB7791C7DFB4800632CA3 /* MVKCommandBuffer.mm */; };
++		CF26634425D7480692082DE4 /* MVKMTLBufferRetention.mm in Sources */ = {isa = PBXBuildFile; fileRef = 0034BCF7930D489E98E2669F /* MVKMTLBufferRetention.mm */; };
+ 		A94FB7D41C7DFB4800632CA3 /* MVKCommandPool.h in Headers */ = {isa = PBXBuildFile; fileRef = A94FB77A1C7DFB4800632CA3 /* MVKCommandPool.h */; };
+ 		A94FB7D51C7DFB4800632CA3 /* MVKCommandPool.h in Headers */ = {isa = PBXBuildFile; fileRef = A94FB77A1C7DFB4800632CA3 /* MVKCommandPool.h */; };
+ 		A94FB7D61C7DFB4800632CA3 /* MVKCommandPool.mm in Sources */ = {isa = PBXBuildFile; fileRef = A94FB77B1C7DFB4800632CA3 /* MVKCommandPool.mm */; };
+@@ -491,6 +494,7 @@
+ 		DCFD7F3A2A45BC6E007BBBF7 /* MVKCommandPool.mm in Sources */ = {isa = PBXBuildFile; fileRef = A94FB77B1C7DFB4800632CA3 /* MVKCommandPool.mm */; };
+ 		DCFD7F3B2A45BC6E007BBBF7 /* MVKCmdDraw.mm in Sources */ = {isa = PBXBuildFile; fileRef = A94FB7751C7DFB4800632CA3 /* MVKCmdDraw.mm */; };
+ 		DCFD7F3C2A45BC6E007BBBF7 /* MVKCommandBuffer.mm in Sources */ = {isa = PBXBuildFile; fileRef = A94FB7791C7DFB4800632CA3 /* MVKCommandBuffer.mm */; };
++		764673FDF5104133A33A66B1 /* MVKMTLBufferRetention.mm in Sources */ = {isa = PBXBuildFile; fileRef = 0034BCF7930D489E98E2669F /* MVKMTLBufferRetention.mm */; };
+ 		DCFD7F3D2A45BC6E007BBBF7 /* MVKCmdRendering.mm in Sources */ = {isa = PBXBuildFile; fileRef = A94FB7731C7DFB4800632CA3 /* MVKCmdRendering.mm */; };
+ 		DCFD7F3E2A45BC6E007BBBF7 /* MVKBuffer.mm in Sources */ = {isa = PBXBuildFile; fileRef = A94FB7801C7DFB4800632CA3 /* MVKBuffer.mm */; };
+ 		DCFD7F3F2A45BC6E007BBBF7 /* MVKEnvironment.cpp in Sources */ = {isa = PBXBuildFile; fileRef = A9A5E9C525C0822700E9085E /* MVKEnvironment.cpp */; };
+@@ -658,6 +662,8 @@
+ 		A94FB7761C7DFB4800632CA3 /* MVKCommand.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = MVKCommand.h; sourceTree = "<group>"; };
+ 		A94FB7781C7DFB4800632CA3 /* MVKCommandBuffer.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = MVKCommandBuffer.h; sourceTree = "<group>"; };
+ 		A94FB7791C7DFB4800632CA3 /* MVKCommandBuffer.mm */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.objcpp; path = MVKCommandBuffer.mm; sourceTree = "<group>"; };
++		DE76BF2A52C34801A6BFD3A1 /* MVKMTLBufferRetention.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = MVKMTLBufferRetention.h; sourceTree = "<group>"; };
++		0034BCF7930D489E98E2669F /* MVKMTLBufferRetention.mm */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.objcpp; path = MVKMTLBufferRetention.mm; sourceTree = "<group>"; };
+ 		A94FB77A1C7DFB4800632CA3 /* MVKCommandPool.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = MVKCommandPool.h; sourceTree = "<group>"; };
+ 		A94FB77B1C7DFB4800632CA3 /* MVKCommandPool.mm */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.objcpp; path = MVKCommandPool.mm; sourceTree = "<group>"; };
+ 		A94FB77C1C7DFB4800632CA3 /* MVKCommandPipelineStateFactoryShaderSource.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = MVKCommandPipelineStateFactoryShaderSource.h; sourceTree = "<group>"; };
+@@ -898,6 +904,8 @@
+ 				A94FB7761C7DFB4800632CA3 /* MVKCommand.h */,
+ 				A94FB7781C7DFB4800632CA3 /* MVKCommandBuffer.h */,
+ 				A94FB7791C7DFB4800632CA3 /* MVKCommandBuffer.mm */,
++				DE76BF2A52C34801A6BFD3A1 /* MVKMTLBufferRetention.h */,
++				0034BCF7930D489E98E2669F /* MVKMTLBufferRetention.mm */,
+ 				A95B7D671D3EE486003183D3 /* MVKCommandEncoderState.h */,
+ 				A95B7D681D3EE486003183D3 /* MVKCommandEncoderState.mm */,
+ 				A90C8DE81F45354D009CB32C /* MVKCommandEncodingPool.h */,
+@@ -2100,6 +2108,7 @@
+ 				2FEA0A9424902F9F00EEF3AD /* MVKCommandPool.mm in Sources */,
+ 				2FEA0A9524902F9F00EEF3AD /* MVKCmdDraw.mm in Sources */,
+ 				2FEA0A9624902F9F00EEF3AD /* MVKCommandBuffer.mm in Sources */,
++				868A8C8B88EE4307BB82875F /* MVKMTLBufferRetention.mm in Sources */,
+ 				2FEA0A9724902F9F00EEF3AD /* MVKCmdRendering.mm in Sources */,
+ 				2FEA0A9824902F9F00EEF3AD /* MVKBuffer.mm in Sources */,
+ 				2FEA0A9924902F9F00EEF3AD /* mvk_datatypes.mm in Sources */,
+@@ -2162,6 +2171,7 @@
+ 				A94FB7D61C7DFB4800632CA3 /* MVKCommandPool.mm in Sources */,
+ 				A94FB7CA1C7DFB4800632CA3 /* MVKCmdDraw.mm in Sources */,
+ 				A94FB7D21C7DFB4800632CA3 /* MVKCommandBuffer.mm in Sources */,
++				B1A9B3F4F5474B6D848EDEFA /* MVKMTLBufferRetention.mm in Sources */,
+ 				A94FB7C61C7DFB4800632CA3 /* MVKCmdRendering.mm in Sources */,
+ 				A94FB7DE1C7DFB4800632CA3 /* MVKBuffer.mm in Sources */,
+ 				A9A5E9C725C0822700E9085E /* MVKEnvironment.cpp in Sources */,
+@@ -2217,6 +2227,7 @@
+ 				A94FB7D71C7DFB4800632CA3 /* MVKCommandPool.mm in Sources */,
+ 				A94FB7CB1C7DFB4800632CA3 /* MVKCmdDraw.mm in Sources */,
+ 				A94FB7D31C7DFB4800632CA3 /* MVKCommandBuffer.mm in Sources */,
++				CF26634425D7480692082DE4 /* MVKMTLBufferRetention.mm in Sources */,
+ 				A94FB7C71C7DFB4800632CA3 /* MVKCmdRendering.mm in Sources */,
+ 				A94FB7DF1C7DFB4800632CA3 /* MVKBuffer.mm in Sources */,
+ 				A9A5E9C925C0822700E9085E /* MVKEnvironment.cpp in Sources */,
+@@ -2300,6 +2311,7 @@
+ 				DCFD7F3A2A45BC6E007BBBF7 /* MVKCommandPool.mm in Sources */,
+ 				DCFD7F3B2A45BC6E007BBBF7 /* MVKCmdDraw.mm in Sources */,
+ 				DCFD7F3C2A45BC6E007BBBF7 /* MVKCommandBuffer.mm in Sources */,
++				764673FDF5104133A33A66B1 /* MVKMTLBufferRetention.mm in Sources */,
+ 				DCFD7F3D2A45BC6E007BBBF7 /* MVKCmdRendering.mm in Sources */,
+ 				DCFD7F3E2A45BC6E007BBBF7 /* MVKBuffer.mm in Sources */,
+ 				DCFD7F3F2A45BC6E007BBBF7 /* MVKEnvironment.cpp in Sources */,
+diff --git a/thirdparty/MoltenVK/MoltenVK/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h b/thirdparty/MoltenVK/MoltenVK/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
+index 2a6dcb8..4dc7dad 100644
+--- a/thirdparty/MoltenVK/MoltenVK/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
++++ b/thirdparty/MoltenVK/MoltenVK/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
+@@ -39,6 +39,7 @@ class MVKQueryPool;
+ class MVKPipeline;
+ class MVKGraphicsPipeline;
+ class MVKComputePipeline;
++class MVKMTLBufferRetention;
+ 
+ typedef uint64_t MVKMTLCommandBufferID;
+ 
+@@ -261,6 +262,9 @@ public:
+ 	/** Encode commands from the specified secondary command buffer onto the Metal command buffer. */
+ 	void encodeSecondary(MVKCommandBuffer* secondaryCmdBuffer);
+ 
++	/** Ownership of conservative physical-address buffer dependencies until Metal completion. */
++	MVKMTLBufferRetention* getGPUAddressableBufferRetention();
++
+ 	/** Begins a render pass and establishes initial draw state. */
+ 	void beginRenderpass(MVKCommand* passCmd,
+ 						 VkSubpassContents subpassContents,
+@@ -490,6 +494,9 @@ public:
+ 	/** The current Metal command buffer. */
+ 	id<MTLCommandBuffer> _mtlCmdBuffer;
+ 
++	/** Borrowed from the actual Metal command buffer, not owned by this encoder. */
++	MVKMTLBufferRetention* _gpuAddressableBufferRetention = nullptr;
++
+ 	/** The current Metal render encoder. */
+ 	id<MTLRenderCommandEncoder> _mtlRenderEncoder;
+ 
+diff --git a/thirdparty/MoltenVK/MoltenVK/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm b/thirdparty/MoltenVK/MoltenVK/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
+index 707c267..0ca4915 100644
+--- a/thirdparty/MoltenVK/MoltenVK/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
++++ b/thirdparty/MoltenVK/MoltenVK/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
+@@ -17,6 +17,7 @@
+  */
+ 
+ #include "MVKCommandBuffer.h"
++#include "MVKMTLBufferRetention.h"
+ #include "MVKFramebuffer.h"
+ #include "MVKCommandPool.h"
+ #include "MVKQueue.h"
+@@ -429,10 +430,18 @@
+     _canUseLayeredRendering = false;
+ 
+     _mtlCmdBuffer = mtlCmdBuff;        // not retained
++	_gpuAddressableBufferRetention = nullptr;
+ 
+ 	_cmdBuffer->setMetalObjectLabel(_mtlCmdBuffer, _cmdBuffer->_debugName);
+ }
+ 
++MVKMTLBufferRetention* MVKCommandEncoder::getGPUAddressableBufferRetention() {
++	if (!_gpuAddressableBufferRetention) {
++		_gpuAddressableBufferRetention = mvkGetMTLBufferRetention(_mtlCmdBuffer);
++	}
++	return _gpuAddressableBufferRetention;
++}
++
+ // Multithread autorelease prefill style uses a dedicated autorelease pool when encoding each command.
+ void MVKCommandEncoder::encodeCommands(MVKCommand* command) {
+ 	if (_prefillStyle == MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS_STYLE_IMMEDIATE_ENCODING) {
+diff --git a/thirdparty/MoltenVK/MoltenVK/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm b/thirdparty/MoltenVK/MoltenVK/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
+index 16fd614..329007b 100644
+--- a/thirdparty/MoltenVK/MoltenVK/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
++++ b/thirdparty/MoltenVK/MoltenVK/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
+@@ -645,7 +645,9 @@ static void bindMetalResources(id<MTLCommandEncoder> encoder,
+ 			mtlShared._gpuAddressableResourceStages = useResourceStage;
+ 		else
+ 			mtlShared._gpuAddressableResourceStages = combineStages(mtlShared._gpuAddressableResourceStages, useResourceStage);
+-		mvkEncoder.getDevice()->encodeGPUAddressableBuffers(mtlShared._useResource, useResourceStage);
++		// Create command-buffer ownership before taking the device resource lock.
++		mvkEncoder.getDevice()->encodeGPUAddressableBuffers(
++			mtlShared._useResource, useResourceStage, mvkEncoder.getGPUAddressableBufferRetention());
+ 	}
+ 
+ 	const MVKShaderStageResourceBinding& resourceCounts = common._layout->getResourceCounts().stages[vkStage];
+diff --git a/thirdparty/MoltenVK/MoltenVK/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/thirdparty/MoltenVK/MoltenVK/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
+index c9ce14a..ca516c8 100644
+--- a/thirdparty/MoltenVK/MoltenVK/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
++++ b/thirdparty/MoltenVK/MoltenVK/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
+@@ -72,6 +72,7 @@ class MVKCommandEncoder;
+ class MVKCommandResourceFactory;
+ class MVKPrivateDataSlot;
+ struct MVKUseResourceHelper;
++class MVKMTLBufferRetention;
+ enum class MVKResourceUsageStages : uint8_t;
+ 
+ 
+@@ -853,7 +854,8 @@ public:
+ #pragma mark Operations
+ 
+ 	/** Tell the GPU to be ready to use any of the GPU-addressable buffers. */
+-	void encodeGPUAddressableBuffers(MVKUseResourceHelper& resources, MVKResourceUsageStages stage);
++	void encodeGPUAddressableBuffers(MVKUseResourceHelper& resources, MVKResourceUsageStages stage,
++									MVKMTLBufferRetention* retention);
+ 
+ 	/** Adds the specified host semaphore to be woken upon device loss. */
+ 	void addSemaphore(MVKSemaphoreImpl* sem4);
+diff --git a/thirdparty/MoltenVK/MoltenVK/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/thirdparty/MoltenVK/MoltenVK/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+index e1f3c04..2f40b28 100644
+--- a/thirdparty/MoltenVK/MoltenVK/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
++++ b/thirdparty/MoltenVK/MoltenVK/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+@@ -30,6 +30,7 @@
+ #include "MVKRenderPass.h"
+ #include "MVKSync.h"
+ #include "MVKCommandPool.h"
++#include "MVKMTLBufferRetention.h"
+ #include "MVKFoundation.h"
+ #include "MVKStrings.h"
+ #include <MoltenVKShaderConverter/SPIRVToMSLConverter.h>
+@@ -4531,10 +4532,19 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+ 	return mvkBuff;
+ }
+ 
+-void MVKDevice::encodeGPUAddressableBuffers(MVKUseResourceHelper& resources, MVKResourceUsageStages stage) {
++void MVKDevice::encodeGPUAddressableBuffers(MVKUseResourceHelper& resources, MVKResourceUsageStages stage,
++										  MVKMTLBufferRetention* retention) {
++	// A failed Metal command-buffer allocation must not publish unowned pointers.
++	if (!retention) { return; }
+ 	lock_guard<mutex> lock(_rezLock);
+ 	for (auto& buff : _gpuAddressableBuffers) {
+-		resources.add(buff->getMTLBuffer(), stage, true);
++		id<MTLBuffer> mtlBuffer = buff->getMTLBuffer();
++		if (!mtlBuffer) { continue; }
++		// Other frame slots may destroy their Vulkan buffers after this snapshot.
++		// Retain the actual Metal object before dropping _rezLock, and keep it
++		// through Metal completion, not just through deferred useResources encoding.
++		retention->retainBuffer(mtlBuffer);
++		resources.add(mtlBuffer, stage, true);
+ 	}
+ }
+ 
+diff --git a/thirdparty/MoltenVK/MoltenVK/MoltenVK/MoltenVK/GPUObjects/MVKImage.h b/thirdparty/MoltenVK/MoltenVK/MoltenVK/MoltenVK/GPUObjects/MVKImage.h
+index cde38ce..587f556 100644
+--- a/thirdparty/MoltenVK/MoltenVK/MoltenVK/MoltenVK/GPUObjects/MVKImage.h
++++ b/thirdparty/MoltenVK/MoltenVK/MoltenVK/MoltenVK/GPUObjects/MVKImage.h
+@@ -499,8 +499,10 @@ protected:
+ 	friend MVKSwapchain;
+ 
+ 	id<CAMetalDrawable> getCAMetalDrawable();
+-	void addPresentedHandler(id<CAMetalDrawable> mtlDrawable, MVKImagePresentInfo presentInfo, MVKSwapchainSignaler signaler);
+-	void releaseMetalDrawable();
++	id<CAMetalDrawable> retainCAMetalDrawable();
++	void addPresentedHandler(id<CAMetalDrawable> mtlDrawable, MVKImagePresentInfo presentInfo,
++							 MVKSwapchainSignaler signaler, uint64_t tracePresentSequence);
++	void releaseMetalDrawable(const char* reason);
+ 	MVKSwapchainImageAvailability getAvailability();
+ 	void makeAvailable();
+ 	VkResult acquireAndSignalWhenAvailable(MVKSemaphore* semaphore, MVKFence* fence);
+@@ -511,6 +513,15 @@ protected:
+ 	MVKSwapchainImageAvailability _availability;
+ 	MVKSmallVector<MVKSwapchainSignaler, 1> _availabilitySignalers;
+ 	MVKSwapchainSignaler _preSignaler = {};
++	std::mutex _mtlDrawableLock;
++	uint64_t _mtlDrawableGeneration = 0;
++	uint64_t _mtlDrawableEpoch = 0;
++	uint64_t _traceLastRenderEvent = 0;
++	uint64_t _traceLastRenderDrawableID = 0;
++	void* _traceLastRenderDrawable = nullptr;
++	void* _traceLastRenderTexture = nullptr;
++	uint64_t _traceLastRenderGeneration = 0;
++	uint64_t _traceLastRenderEpoch = 0;
+ 	std::mutex _availabilityLock;
+ 	uint64_t _beginPresentTime = 0;
+ 	uint64_t _presentationStartTime = 0;
+diff --git a/thirdparty/MoltenVK/MoltenVK/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm b/thirdparty/MoltenVK/MoltenVK/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+index 5463d5a..aebd8d7 100644
+--- a/thirdparty/MoltenVK/MoltenVK/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
++++ b/thirdparty/MoltenVK/MoltenVK/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+@@ -29,9 +29,30 @@
+ #import "MTLSamplerDescriptor+MoltenVK.h"
+ #import "CAMetalLayer+MoltenVK.h"
+ 
++#include <atomic>
++#include <cstdlib>
++
+ using namespace std;
+ using namespace SPIRV_CROSS_NAMESPACE;
+ 
++static bool isLibertyTVDrawableTraceEnabled() {
++	static const bool isEnabled = [] {
++		const char* value = std::getenv("LIBERTY_TV_MVK_TRACE");
++		return value && value[0] && value[0] != '0';
++	}();
++	return isEnabled;
++}
++
++static uint64_t getLibertyTVDrawableID(id<CAMetalDrawable> drawable) {
++	if (drawable && [drawable respondsToSelector: @selector(drawableID)]) {
++		return drawable.drawableID;
++	}
++	return 0;
++}
++
++static std::atomic<uint64_t> libertyTVRenderEventSequence{0};
++static std::atomic<uint64_t> libertyTVPresentSequence{0};
++
+ #pragma mark -
+ #pragma mark MVKImagePlane
+ 
+@@ -1538,9 +1559,14 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ 
+ 	// Now that this image is being acquired, release the existing drawable and its texture.
+ 	// This is not done earlier so the texture is retained for any post-processing such as screen captures, etc.
+-	releaseMetalDrawable();
++	releaseMetalDrawable("acquire");
+ 
+ 	lock_guard<mutex> lock(_availabilityLock);
++	if (isLibertyTVDrawableTraceEnabled()) {
++		MVKLogInfo("liberty-tv-mvk: event=acquire image=%u available=%s waiters=%zu",
++				   _swapchainIndex, _availability.isAvailable ? "true" : "false",
++				   _availabilitySignalers.size());
++	}
+ 
+ 	// Upon acquisition, update acquisition ID immediately, to move it to the back of the chain,
+ 	// so other images will be preferred if either all images are available or no images are available.
+@@ -1581,47 +1607,211 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ 
+ 	if (_mtlTextureHeadless) { return nil; }	// If headless, there is no drawable.
+ 
+-	if ( !_mtlDrawable ) {
+-		@autoreleasepool {
+-			bool hasInvalidFormat = false;
+-			uint32_t attemptCnt = _swapchain->getImageCount();	// Attempt a resonable number of times
+-			for (uint32_t attemptIdx = 0; !_mtlDrawable && attemptIdx < attemptCnt; attemptIdx++) {
+-				uint64_t startTime = getPerformanceTimestamp();
+-				_mtlDrawable = [_swapchain->getCAMetalLayer().nextDrawable retain];	// retained
+-				addPerformanceInterval(getPerformanceStats().queue.retrieveCAMetalDrawable, startTime);
+-				hasInvalidFormat = _mtlDrawable && !_mtlDrawable.texture.pixelFormat;
+-				if (hasInvalidFormat) { releaseMetalDrawable(); }
++	uint64_t fetchGeneration = 0;
++	{
++		lock_guard<mutex> lock(_mtlDrawableLock);
++		if (_mtlDrawable) { return _mtlDrawable; }
++		fetchGeneration = _mtlDrawableGeneration;
++	}
++
++	// nextDrawable may block while Core Animation waits for the finite drawable
++	// pool. Never hold _mtlDrawableLock across that call because presentation
++	// callbacks need the same lock to retire the previous drawable.
++	id<CAMetalDrawable> drawable = nil;
++	bool sawInvalidFormat = false;
++	uint32_t attemptCnt = _swapchain->getImageCount();	// Attempt a reasonable number of times.
++	@autoreleasepool {
++		for (uint32_t attemptIdx = 0; !drawable && attemptIdx < attemptCnt; attemptIdx++) {
++			id<CAMetalDrawable> publishedDrawable = nil;
++			uint64_t publishedGeneration = 0;
++			uint64_t publishedEpoch = 0;
++			uint64_t startTime = getPerformanceTimestamp();
++			id<CAMetalDrawable> fetchedDrawable =
++				[_swapchain->getCAMetalLayer().nextDrawable retain];	// retained
++			addPerformanceInterval(getPerformanceStats().queue.retrieveCAMetalDrawable, startTime);
++			if (fetchedDrawable && !fetchedDrawable.texture.pixelFormat) {
++				sawInvalidFormat = true;
++				[fetchedDrawable release];
++				continue;
+ 			}
+-			if (hasInvalidFormat) {
+-				setConfigurationResult(reportError(VK_ERROR_OUT_OF_DATE_KHR, "CAMetalDrawable with valid format could not be acquired after %d attempts.", attemptCnt));
+-			} else if ( !_mtlDrawable ) {
+-				setConfigurationResult(reportError(VK_ERROR_OUT_OF_POOL_MEMORY, "CAMetalDrawable could not be acquired after %d attempts.", attemptCnt));
++
++			{
++				lock_guard<mutex> lock(_mtlDrawableLock);
++				// Another queue operation may have populated the cache while
++				// nextDrawable was blocked. A release may also have invalidated
++				// this fetch while it was blocked. Publish only into the generation
++				// in which the fetch began, otherwise discard it and retry.
++				if (_mtlDrawable) {
++					drawable = _mtlDrawable;
++				} else if (fetchedDrawable &&
++						   fetchGeneration == _mtlDrawableGeneration) {
++					_mtlDrawable = fetchedDrawable;
++					fetchedDrawable = nil;
++					drawable = _mtlDrawable;
++					++_mtlDrawableEpoch;
++					if (isLibertyTVDrawableTraceEnabled()) {
++						publishedDrawable = [_mtlDrawable retain];
++						publishedGeneration = _mtlDrawableGeneration;
++						publishedEpoch = _mtlDrawableEpoch;
++					}
++				} else {
++					fetchGeneration = _mtlDrawableGeneration;
++				}
+ 			}
++			if (publishedDrawable) {
++				MVKLogInfo("liberty-tv-mvk: event=drawable-publish image=%u drawable=%p drawable-id=%llu texture=%p generation=%llu epoch=%llu",
++						   _swapchainIndex, (void*)publishedDrawable,
++						   (unsigned long long)getLibertyTVDrawableID(publishedDrawable),
++						   (void*)publishedDrawable.texture,
++						   (unsigned long long)publishedGeneration,
++						   (unsigned long long)publishedEpoch);
++				[publishedDrawable release];
++			}
++			[fetchedDrawable release];
++		}
++	}
++
++	if (!drawable) {
++		if (sawInvalidFormat) {
++			setConfigurationResult(reportError(VK_ERROR_OUT_OF_DATE_KHR, "CAMetalDrawable with valid format could not be acquired after %d attempts.", attemptCnt));
++		} else {
++			setConfigurationResult(reportError(VK_ERROR_OUT_OF_POOL_MEMORY, "CAMetalDrawable could not be acquired after %d attempts.", attemptCnt));
+ 		}
+ 	}
+-	return _mtlDrawable;
++	return drawable;
++}
++
++// Returns a drawable with +1 ownership. The read and retain must be atomic
++// with respect to releaseMetalDrawable(), otherwise acquisition can release
++// the last reference between a raw-pointer read and the keep-alive retain.
++id<CAMetalDrawable> MVKPresentableSwapchainImage::retainCAMetalDrawable() {
++	getCAMetalDrawable();
++	lock_guard<mutex> lock(_mtlDrawableLock);
++	return [_mtlDrawable retain];
+ }
+ 
+ // If not headless, retrieve the MTLTexture directly from the CAMetalDrawable.
+ id<MTLTexture> MVKPresentableSwapchainImage::getMTLTexture(uint8_t planeIndex) {
+-	return _mtlTextureHeadless ? _mtlTextureHeadless : getCAMetalDrawable().texture;
++	if (_mtlTextureHeadless) { return _mtlTextureHeadless; }
++
++	id<CAMetalDrawable> drawable = retainCAMetalDrawable();
++	if (!drawable) { return nil; }
++	id<MTLTexture> texture = drawable.texture;
++	if (isLibertyTVDrawableTraceEnabled()) {
++		uint64_t renderEvent = ++libertyTVRenderEventSequence;
++		uint64_t generation = 0;
++		uint64_t epoch = 0;
++		bool cacheMatch = false;
++		{
++			lock_guard<mutex> lock(_mtlDrawableLock);
++			generation = _mtlDrawableGeneration;
++			epoch = _mtlDrawableEpoch;
++			cacheMatch = _mtlDrawable == drawable;
++			_traceLastRenderEvent = renderEvent;
++			_traceLastRenderDrawableID = getLibertyTVDrawableID(drawable);
++			_traceLastRenderDrawable = (void*)drawable;
++			_traceLastRenderTexture = (void*)texture;
++			_traceLastRenderGeneration = generation;
++			_traceLastRenderEpoch = epoch;
++		}
++		MVKLogInfo("liberty-tv-mvk: event=render-texture render-event=%llu image=%u drawable=%p drawable-id=%llu texture=%p generation=%llu epoch=%llu cache-match=%s plane=%u",
++				   (unsigned long long)renderEvent, _swapchainIndex,
++				   (void*)drawable,
++				   (unsigned long long)getLibertyTVDrawableID(drawable),
++				   (void*)texture, (unsigned long long)generation,
++				   (unsigned long long)epoch,
++				   cacheMatch ? "true" : "false", planeIndex);
++	}
++	[drawable release];
++	return texture;
+ }
+ 
+ // Present the drawable and make myself available only once the command buffer has completed.
+ // Pass MVKImagePresentInfo by value because it may not exist when the callback runs.
+ VkResult MVKPresentableSwapchainImage::presentCAMetalDrawable(id<MTLCommandBuffer> mtlCmdBuff,
+-															  MVKImagePresentInfo presentInfo) {
+-	_swapchain->renderWatermark(getMTLTexture(0), mtlCmdBuff);
+-
++														  MVKImagePresentInfo presentInfo) {
+ 	// According to Apple, it is more performant to call MTLDrawable present from within a
+ 	// MTLCommandBuffer scheduled-handler than it is to call MTLCommandBuffer presentDrawable:.
+ 	// But get current drawable now, intead of in handler, because a new drawable might be acquired by then.
+ 	// Attach present handler before presenting to avoid race condition.
+-	id<CAMetalDrawable> mtlDrwbl = getCAMetalDrawable();
++	id<CAMetalDrawable> mtlDrwbl = retainCAMetalDrawable();
++	if (!mtlDrwbl) {
++		// getCAMetalDrawable() reports acquisition failures itself. A successful
++		// result followed by nil here means the drawable was retired between the
++		// lookup and the ownership-taking lock; never report a successful present
++		// for an image that has no drawable.
++		if (getConfigurationResult() == VK_SUCCESS) {
++			setConfigurationResult(reportError(VK_ERROR_OUT_OF_DATE_KHR,
++										 "CAMetalDrawable became unavailable before presentation."));
++		}
++		return getConfigurationResult();
++	}
++	const bool traceDrawable = isLibertyTVDrawableTraceEnabled();
++	const uint64_t tracePresentSequence =
++		traceDrawable ? ++libertyTVPresentSequence : 0;
++	if (traceDrawable) {
++		uint64_t generation = 0;
++		uint64_t epoch = 0;
++		uint64_t renderEvent = 0;
++		uint64_t renderDrawableID = 0;
++		void* renderDrawable = nullptr;
++		void* renderTexture = nullptr;
++		uint64_t renderGeneration = 0;
++		uint64_t renderEpoch = 0;
++		{
++			lock_guard<mutex> lock(_mtlDrawableLock);
++			generation = _mtlDrawableGeneration;
++			epoch = _mtlDrawableEpoch;
++			renderEvent = _traceLastRenderEvent;
++			renderDrawableID = _traceLastRenderDrawableID;
++			renderDrawable = _traceLastRenderDrawable;
++			renderTexture = _traceLastRenderTexture;
++			renderGeneration = _traceLastRenderGeneration;
++			renderEpoch = _traceLastRenderEpoch;
++		}
++		const uint64_t presentDrawableID = getLibertyTVDrawableID(mtlDrwbl);
++		const void* presentTexture = (void*)mtlDrwbl.texture;
++		const bool identityMatch =
++			renderEvent && renderDrawable == (void*)mtlDrwbl &&
++			renderDrawableID == presentDrawableID &&
++			renderTexture == presentTexture &&
++			renderGeneration == generation && renderEpoch == epoch;
++		MVKLogInfo("liberty-tv-mvk: event=present-capture present-seq=%llu image=%u present-id=%llu drawable=%p drawable-id=%llu texture=%p generation=%llu epoch=%llu render-event=%llu render-drawable=%p render-drawable-id=%llu render-texture=%p render-generation=%llu render-epoch=%llu identity-match=%s",
++				   (unsigned long long)tracePresentSequence, _swapchainIndex,
++				   (unsigned long long)presentInfo.presentId, (void*)mtlDrwbl,
++				   (unsigned long long)presentDrawableID, presentTexture,
++				   (unsigned long long)generation, (unsigned long long)epoch,
++				   (unsigned long long)renderEvent, renderDrawable,
++				   (unsigned long long)renderDrawableID, renderTexture,
++				   (unsigned long long)renderGeneration,
++				   (unsigned long long)renderEpoch,
++				   identityMatch ? "true" : "false");
++	}
++	_swapchain->renderWatermark(mtlDrwbl.texture, mtlCmdBuff);
+ 	MVKSwapchainSignaler signaler = getPresentationSignaler();
+ 	[mtlCmdBuff addScheduledHandler: ^(id<MTLCommandBuffer> mcb) {
++		if (traceDrawable) {
++			CAMetalLayer* layer = mtlDrwbl.layer;
++			const CGRect bounds = layer.bounds;
++			const CGSize drawableSize = layer.drawableSize;
++			MVKLogInfo("liberty-tv-mvk: event=present-scheduled present-seq=%llu image=%u drawable=%p drawable-id=%llu texture=%p command-buffer=%p status=%lu layer=%p superlayer=%p delegate=%p hidden=%s opaque=%s framebuffer-only=%s display-sync=%s contents-scale=%.3f bounds=%.3f,%.3f,%.3f,%.3f drawable-size=%.3f,%.3f",
++					   (unsigned long long)tracePresentSequence, _swapchainIndex,
++					   (void*)mtlDrwbl,
++					   (unsigned long long)getLibertyTVDrawableID(mtlDrwbl),
++					   (void*)mtlDrwbl.texture, (void*)mcb,
++					   (unsigned long)mcb.status, (void*)layer,
++					   (void*)layer.superlayer, (void*)layer.delegate,
++					   layer.hidden ? "true" : "false",
++					   layer.opaque ? "true" : "false",
++					   layer.framebufferOnly ? "true" : "false",
++					   layer.displaySyncEnabledMVK ? "true" : "false",
++					   layer.contentsScale, bounds.origin.x, bounds.origin.y,
++					   bounds.size.width, bounds.size.height,
++					   drawableSize.width, drawableSize.height);
++		}
+ 
+-		addPresentedHandler(mtlDrwbl, presentInfo, signaler);
++		addPresentedHandler(mtlDrwbl, presentInfo, signaler,
++						tracePresentSequence);
+ 
+ 		// Try to do any present mode transitions as late as possible in an attempt
+ 		// to avoid visual disruptions on any presents already on the queue.
+@@ -1629,8 +1819,21 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ 			mtlDrwbl.layer.displaySyncEnabledMVK = (presentInfo.presentMode != VK_PRESENT_MODE_IMMEDIATE_KHR);
+ 		}
+ 		if (presentInfo.desiredPresentTime) {
++			if (traceDrawable) {
++				MVKLogInfo("liberty-tv-mvk: event=present-call present-seq=%llu image=%u drawable-id=%llu mode=at-time desired-time=%llu",
++						   (unsigned long long)tracePresentSequence,
++						   _swapchainIndex,
++						   (unsigned long long)getLibertyTVDrawableID(mtlDrwbl),
++						   (unsigned long long)presentInfo.desiredPresentTime);
++			}
+ 			[mtlDrwbl presentAtTime: (double)presentInfo.desiredPresentTime * 1.0e-9];
+ 		} else {
++			if (traceDrawable) {
++				MVKLogInfo("liberty-tv-mvk: event=present-call present-seq=%llu image=%u drawable-id=%llu mode=immediate",
++						   (unsigned long long)tracePresentSequence,
++						   _swapchainIndex,
++						   (unsigned long long)getLibertyTVDrawableID(mtlDrwbl));
++			}
+ 			[mtlDrwbl present];
+ 		}
+ 	}];
+@@ -1642,10 +1845,19 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ 	// from this callback, because the last one or two presentation completion
+ 	// callbacks can occasionally stall.
+ 	retain();
+-	[mtlDrwbl retain];
+ 	auto* fence = presentInfo.fence;
+ 	if (fence) { fence->retain(); }
+ 	[mtlCmdBuff addCompletedHandler: ^(id<MTLCommandBuffer> mcb) {
++		if (traceDrawable) {
++			NSError* error = mcb.error;
++			MVKLogInfo("liberty-tv-mvk: event=present-command-completed present-seq=%llu image=%u drawable-id=%llu command-buffer=%p status=%lu error-domain=%s error-code=%ld error=%s",
++					   (unsigned long long)tracePresentSequence, _swapchainIndex,
++					   (unsigned long long)getLibertyTVDrawableID(mtlDrwbl),
++					   (void*)mcb, (unsigned long)mcb.status,
++					   error ? error.domain.UTF8String : "none",
++					   error ? (long)error.code : 0L,
++					   error ? error.localizedDescription.UTF8String : "none");
++		}
+ 		signal(fence);
+ 		if (fence) { fence->release(); }
+ 		[mtlDrwbl release];
+@@ -1683,16 +1895,32 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ // Pass MVKImagePresentInfo & MVKSwapchainSignaler by value because they may not exist when the callback runs.
+ void MVKPresentableSwapchainImage::addPresentedHandler(id<CAMetalDrawable> mtlDrawable,
+ 													   MVKImagePresentInfo presentInfo,
+-													   MVKSwapchainSignaler signaler) {
++													   MVKSwapchainSignaler signaler,
++													   uint64_t tracePresentSequence) {
+ 	beginPresentation(presentInfo);
+ 
+ #if !MVK_OS_SIMULATOR
+ 	[mtlDrawable addPresentedHandler: ^(id<MTLDrawable> mtlDrwbl) {
+-		endPresentation(presentInfo, signaler, mtlDrwbl.presentedTime * 1.0e9);
++		const double rawPresentedTime = mtlDrwbl.presentedTime;
++		if (isLibertyTVDrawableTraceEnabled()) {
++			MVKLogInfo("liberty-tv-mvk: event=presented present-seq=%llu image=%u drawable=%p drawable-id=%llu raw-presented-time=%.9f dropped=%s",
++					   (unsigned long long)tracePresentSequence, _swapchainIndex,
++					   (void*)mtlDrwbl,
++					   (unsigned long long)getLibertyTVDrawableID((id<CAMetalDrawable>)mtlDrwbl),
++					   rawPresentedTime,
++					   rawPresentedTime == 0.0 ? "true" : "false");
++		}
++		endPresentation(presentInfo, signaler, rawPresentedTime * 1.0e9);
+ 	}];
+ #else
+ 	// If MTLDrawable.presentedTime/addPresentedHandler isn't supported,
+ 	// treat it as if the present happened when requested.
++	if (isLibertyTVDrawableTraceEnabled()) {
++		MVKLogInfo("liberty-tv-mvk: event=presented present-seq=%llu image=%u drawable=%p drawable-id=%llu raw-presented-time=unsupported dropped=unknown",
++				   (unsigned long long)tracePresentSequence, _swapchainIndex,
++				   (void*)mtlDrawable,
++				   (unsigned long long)getLibertyTVDrawableID(mtlDrawable));
++	}
+ 	endPresentation(presentInfo, signaler);
+ #endif
+ }
+@@ -1731,15 +1959,41 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ }
+ 
+ // Releases the CAMetalDrawable underlying this image.
+-void MVKPresentableSwapchainImage::releaseMetalDrawable() {
+-    [_mtlDrawable release];
+-	_mtlDrawable = nil;
++void MVKPresentableSwapchainImage::releaseMetalDrawable(const char* reason) {
++	id<CAMetalDrawable> drawable = nil;
++	id<MTLTexture> texture = nil;
++	uint64_t drawableID = 0;
++	uint64_t generationBefore = 0;
++	uint64_t generationAfter = 0;
++	uint64_t epoch = 0;
++	{
++		lock_guard<mutex> lock(_mtlDrawableLock);
++		drawable = _mtlDrawable;
++		texture = drawable.texture;
++		drawableID = getLibertyTVDrawableID(drawable);
++		generationBefore = _mtlDrawableGeneration;
++		epoch = _mtlDrawableEpoch;
++		_mtlDrawable = nil;
++		++_mtlDrawableGeneration;
++		generationAfter = _mtlDrawableGeneration;
++	}
++	if (isLibertyTVDrawableTraceEnabled()) {
++		MVKLogInfo("liberty-tv-mvk: event=drawable-release reason=%s image=%u drawable=%p drawable-id=%llu texture=%p generation-before=%llu generation-after=%llu epoch=%llu",
++				   reason ? reason : "unknown", _swapchainIndex, (void*)drawable,
++				   (unsigned long long)drawableID, (void*)texture,
++				   (unsigned long long)generationBefore,
++				   (unsigned long long)generationAfter,
++				   (unsigned long long)epoch);
++	}
++	// Releasing a drawable may synchronously trigger Core Animation callbacks.
++	// Keep those callbacks outside the ownership lock.
++	[drawable release];
+ }
+ 
+ // Signal, untrack, and release any signalers that are tracking.
+ // Release the drawable before the lock, as it may trigger completion callback.
+ void MVKPresentableSwapchainImage::makeAvailable() {
+-	releaseMetalDrawable();
++	releaseMetalDrawable("make-available");
+ 	lock_guard<mutex> lock(_availabilityLock);
+ 
+ 	if ( !_availability.isAvailable ) {
+@@ -1779,7 +2033,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ 
+ 
+ void MVKPresentableSwapchainImage::destroy() {
+-	releaseMetalDrawable();
++	releaseMetalDrawable("destroy");
+ 	[_mtlTextureHeadless release];
+ 	_mtlTextureHeadless = nil;
+ 	MVKSwapchainImage::destroy();
+Submodule thirdparty/ffmpeg-core contains modified content
+diff --git a/thirdparty/ffmpeg-core/CMakeLists.txt b/thirdparty/ffmpeg-core/CMakeLists.txt
+index 329b16c..34d1357 100644
+--- a/thirdparty/ffmpeg-core/CMakeLists.txt
++++ b/thirdparty/ffmpeg-core/CMakeLists.txt
+@@ -43,13 +43,34 @@ execute_process(
+ set(FFMPEG_ZIP_PATH "${CMAKE_BINARY_DIR}/external/ffmpeg-${FFMPEG_GIT_SHA}.zip")
+ if(NOT EXISTS "${FFMPEG_ZIP_PATH}")
+ 	message(STATUS "Downloading FFMPEG prebuilts...")
+-	file(DOWNLOAD https://github.com/IsaacMarovitz/ffmpeg-core/releases/download/${FFMPEG_GIT_SHA}/${FFMPEG_PREBUILTS_NAME}
+-			"${FFMPEG_ZIP_PATH}" SHOW_PROGRESS
+-		STATUS FILE_STATUS)
+-	list(GET FILE_STATUS 0 STATUS_CODE)
+-	if (NOT STATUS_CODE EQUAL 0)
+-		file(REMOVE "${FFMPEG_ZIP_PATH}") # CMake create 0 byte file even if URL is invalid. So need to delete it.
+-		message(FATAL_ERROR "No FFMPEG prebuilt found with corresponding commit SHA (${FFMPEG_GIT_SHA})")
++	set(FFMPEG_DOWNLOAD_URLS
++		"https://github.com/sonicnext-dev/ffmpeg-core/releases/download/${FFMPEG_GIT_SHA}/${FFMPEG_PREBUILTS_NAME}"
++		"https://github.com/IsaacMarovitz/ffmpeg-core/releases/download/${FFMPEG_GIT_SHA}/${FFMPEG_PREBUILTS_NAME}"
++		"https://github.com/shadps4-emu/ext-ffmpeg-core/releases/download/${FFMPEG_GIT_SHA}/${FFMPEG_PREBUILTS_NAME}")
++	set(FFMPEG_DOWNLOAD_SUCCESS FALSE)
++	set(FFMPEG_DOWNLOAD_ERROR "")
++
++	foreach(FFMPEG_DOWNLOAD_URL IN LISTS FFMPEG_DOWNLOAD_URLS)
++		file(DOWNLOAD "${FFMPEG_DOWNLOAD_URL}"
++				"${FFMPEG_ZIP_PATH}" SHOW_PROGRESS
++			STATUS FILE_STATUS
++			LOG FILE_LOG)
++		list(GET FILE_STATUS 0 STATUS_CODE)
++		list(GET FILE_STATUS 1 STATUS_TEXT)
++		if (STATUS_CODE EQUAL 0)
++			set(FFMPEG_DOWNLOAD_SUCCESS TRUE)
++			break()
++		endif()
++
++		file(REMOVE "${FFMPEG_ZIP_PATH}") # CMake creates a 0-byte file when a download fails.
++		set(FFMPEG_DOWNLOAD_ERROR
++			"${FFMPEG_DOWNLOAD_ERROR}\nURL: ${FFMPEG_DOWNLOAD_URL}\nStatus: ${STATUS_CODE} (${STATUS_TEXT})\nLog:\n${FILE_LOG}\n")
++	endforeach()
++
++	if (NOT FFMPEG_DOWNLOAD_SUCCESS)
++		message(FATAL_ERROR
++			"Failed to download FFMPEG prebuilt for commit SHA (${FFMPEG_GIT_SHA}) and asset (${FFMPEG_PREBUILTS_NAME})."
++			"${FFMPEG_DOWNLOAD_ERROR}")
+ 	endif()
+ endif()
+ 
+Submodule thirdparty/plume contains modified content
+diff --git a/thirdparty/plume/plume_render_interface_types.h b/thirdparty/plume/plume_render_interface_types.h
+index 9dcfedf..34847b9 100644
+--- a/thirdparty/plume/plume_render_interface_types.h
++++ b/thirdparty/plume/plume_render_interface_types.h
+@@ -60,6 +60,15 @@ namespace plume {
+         }
+         bool operator!=(const struct RenderWindow& rhs) const { return !(*this == rhs); }
+     };
++#elif defined(__ORBIS__) || defined(LIBERTY_RECOMP_PS4)
++    // PS4: No windowing system. RenderWindow wraps the sceVideoOut handle.
++    struct RenderWindow {
++        int videoOutHandle;
++        bool operator==(const struct RenderWindow& rhs) const {
++            return videoOutHandle == rhs.videoOutHandle;
++        }
++        bool operator!=(const struct RenderWindow& rhs) const { return !(*this == rhs); }
++    };
+ #else
+     static_assert(false, "RenderWindow was not defined for this platform.");
+ #endif
+Submodule tools/XenosRecomp contains modified content
+diff --git a/tools/XenosRecomp/XenosRecomp/CMakeLists.txt b/tools/XenosRecomp/XenosRecomp/CMakeLists.txt
+index b187f59..36c5fc1 100644
+--- a/tools/XenosRecomp/XenosRecomp/CMakeLists.txt
++++ b/tools/XenosRecomp/XenosRecomp/CMakeLists.txt
+@@ -1,5 +1,7 @@
+ project(XenosRecomp)
+ 
++option(XENOS_RECOMP_GTA4 "Generate GTA IV-compatible shader interfaces" OFF)
++
+ if (WIN32)
+     option(XENOS_RECOMP_DXIL "Generate DXIL shader cache" ON)
+ endif()
+@@ -32,6 +34,10 @@ target_include_directories(XenosRecomp PRIVATE ${SMOLV_SOURCE_DIR})
+ 
+ target_precompile_headers(XenosRecomp PRIVATE pch.h)
+ 
++if (XENOS_RECOMP_GTA4)
++    target_compile_definitions(XenosRecomp PRIVATE GTA4_RECOMP)
++endif()
++
+ if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
+     target_compile_options(XenosRecomp PRIVATE -Wno-switch -Wno-unused-variable -Wno-null-arithmetic -fms-extensions)
+ endif()
+diff --git a/tools/XenosRecomp/XenosRecomp/air_compiler.cpp b/tools/XenosRecomp/XenosRecomp/air_compiler.cpp
+index 6cd79e3..131f890 100644
+--- a/tools/XenosRecomp/XenosRecomp/air_compiler.cpp
++++ b/tools/XenosRecomp/XenosRecomp/air_compiler.cpp
+@@ -5,6 +5,8 @@
+ #include <spawn.h>
+ #include <unistd.h>
+ 
++extern char** environ;
++
+ struct TemporaryPath
+ {
+     const std::string path;
+@@ -20,7 +22,7 @@ struct TemporaryPath
+ static int executeCommand(const char** argv)
+ {
+     pid_t pid;
+-    if (posix_spawn(&pid, argv[0], nullptr, nullptr, const_cast<char**>(argv), nullptr) != 0)
++    if (posix_spawn(&pid, argv[0], nullptr, nullptr, const_cast<char**>(argv), environ) != 0)
+         return -1;
+ 
+     int status;
+@@ -54,12 +56,19 @@ std::vector<uint8_t> AirCompiler::compile(const std::string& shaderSource)
+     }
+ 
+     const char* compileCommand[] = {
+-        "/usr/bin/xcrun", "-sdk", "macosx", "metal", "-o", irPath.path.c_str(), "-c", sourcePath.path.c_str(), "-Wno-unused-variable", "-frecord-sources", "-gline-tables-only", "-fmetal-math-mode=relaxed", "-D__air__",
++        // Let xcrun select the installed Metal toolchain. Passing
++        // "-sdk macosx" bypasses the separately downloaded MobileAsset
++        // toolchain in recent Xcode releases even though `xcrun metal` finds
++        // it correctly.
++        "/usr/bin/xcrun", "metal", "-o", irPath.path.c_str(), "-c", sourcePath.path.c_str(), "-Wno-unused-variable", "-frecord-sources", "-gline-tables-only", "-fmetal-math-mode=relaxed", "-D__air__",
+ #ifdef UNLEASHED_RECOMP
+         "-DUNLEASHED_RECOMP",
+ #endif
+ #ifdef MARATHON_RECOMP
+         "-DMARATHON_RECOMP",
++#endif
++#ifdef GTA4_RECOMP
++        "-DGTA4_RECOMP",
+ #endif
+         nullptr
+     };
+@@ -70,7 +79,7 @@ std::vector<uint8_t> AirCompiler::compile(const std::string& shaderSource)
+         std::exit(1);
+     }
+ 
+-    const char* linkCommand[] = { "/usr/bin/xcrun", "-sdk", "macosx", "metallib", "-o", metalLibPath.path.c_str(), irPath.path.c_str(), nullptr };
++    const char* linkCommand[] = { "/usr/bin/xcrun", "metallib", "-o", metalLibPath.path.c_str(), irPath.path.c_str(), nullptr };
+     if (const int linkStatus = executeCommand(linkCommand); linkStatus != 0)
+     {
+         fmt::println("Metal linker exited with status: {}", linkStatus);
+diff --git a/tools/XenosRecomp/XenosRecomp/dxc_compiler.cpp b/tools/XenosRecomp/XenosRecomp/dxc_compiler.cpp
+index 3386952..a466d3b 100644
+--- a/tools/XenosRecomp/XenosRecomp/dxc_compiler.cpp
++++ b/tools/XenosRecomp/XenosRecomp/dxc_compiler.cpp
+@@ -43,6 +43,9 @@ IDxcBlob* DxcCompiler::compile(const std::string& shaderSource, bool compilePixe
+     args[argCount++] = L"-HV 2021";
+     args[argCount++] = L"-all-resources-bound";
+ 
++    if (compilePixelShader)
++        args[argCount++] = L"-DXENOS_RECOMP_PIXEL_SHADER";
++
+     if (compileSpirv)
+     {
+         args[argCount++] = L"-spirv";
+@@ -65,6 +68,9 @@ IDxcBlob* DxcCompiler::compile(const std::string& shaderSource, bool compilePixe
+ #ifdef MARATHON_RECOMP
+     args[argCount++] = L"-DMARATHON_RECOMP";
+ #endif
++#ifdef GTA4_RECOMP
++    args[argCount++] = L"-DGTA4_RECOMP";
++#endif
+ 
+     IDxcResult* result = nullptr;
+     HRESULT hr = dxcCompiler->Compile(&source, args, argCount, nullptr, IID_PPV_ARGS(&result));
+diff --git a/tools/XenosRecomp/XenosRecomp/main.cpp b/tools/XenosRecomp/XenosRecomp/main.cpp
+index a8b87a6..753bcd3 100644
+--- a/tools/XenosRecomp/XenosRecomp/main.cpp
++++ b/tools/XenosRecomp/XenosRecomp/main.cpp
+@@ -1,10 +1,13 @@
+ #include <deque>
++#include <fstream>
+ #include <mutex>
+ #include <thread>
+ 
+ #include "shader.h"
++#include "shader_common.h"
+ #include "shader_recompiler.h"
+ #include "dxc_compiler.h"
++#include "shader_source_preservation.h"
+ 
+ #ifdef XENOS_RECOMP_AIR
+ #include "air_compiler.h"
+@@ -34,31 +37,50 @@ struct RecompiledShader
+     uint8_t* data = nullptr;
+     IDxcBlob* dxil = nullptr;
+     std::vector<uint8_t> spirv;
++    std::vector<uint8_t> lateSpirv;
+     std::vector<uint8_t> air;
+     uint32_t specConstantsMask = 0;
++    uint32_t usedTextureMask = 0;
++    bool recoveredPixelShader = false;
++    std::string recoveredEarly;
++    std::string recoveredLate;
+ };
+ 
+ void recompileShader(RecompiledShader& shader, const std::string_view include, std::atomic<uint32_t>& progress, uint32_t numShaders)
+ {
++    static DxcCompiler dxcCompiler;
++    static std::mutex dxcCompilerMutex;
++
+     thread_local ShaderRecompiler recompiler;
+     recompiler = {};
+-    recompiler.recompile(shader.data, include);
+-
+-    shader.specConstantsMask = recompiler.specConstantsMask;
+-
+-    thread_local DxcCompiler dxcCompiler;
++    const bool recovered = !shader.recoveredEarly.empty();
++    if (!recovered)
++    {
++        recompiler.recompile(shader.data, include);
++        shader.specConstantsMask = recompiler.specConstantsMask;
++        shader.usedTextureMask = recompiler.usedTextureMask;
++    }
++    const std::string& earlySource = recovered ? shader.recoveredEarly : recompiler.out;
++    const bool isPixelShader = recovered ? shader.recoveredPixelShader : recompiler.isPixelShader;
+ 
+ #ifdef XENOS_RECOMP_DXIL
+-    shader.dxil = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, recompiler.specConstantsMask != 0, false);
++    {
++        std::lock_guard lock(dxcCompilerMutex);
++        shader.dxil = dxcCompiler.compile(earlySource, isPixelShader, shader.specConstantsMask != 0, false);
++    }
+     assert(shader.dxil != nullptr);
+     assert(*(reinterpret_cast<uint32_t *>(shader.dxil->GetBufferPointer()) + 1) != 0 && "DXIL was not signed properly!");
+ #endif
+ 
+ #ifdef XENOS_RECOMP_AIR
+-    shader.air = AirCompiler::compile(recompiler.out);
++    shader.air = AirCompiler::compile(earlySource);
+ #endif
+ 
+-    IDxcBlob* spirv = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, false, true);
++    IDxcBlob* spirv;
++    {
++        std::lock_guard lock(dxcCompilerMutex);
++        spirv = dxcCompiler.compile(earlySource, isPixelShader, false, true);
++    }
+     assert(spirv != nullptr);
+ 
+     bool result = smolv::Encode(spirv->GetBufferPointer(), spirv->GetBufferSize(), shader.spirv, smolv::kEncodeFlagStripDebugInfo);
+@@ -66,6 +88,29 @@ void recompileShader(RecompiledShader& shader, const std::string_view include, s
+ 
+     spirv->Release();
+ 
++    if (recovered ? !shader.recoveredLate.empty() :
++        (isPixelShader && (shader.specConstantsMask & SPEC_CONSTANT_ALPHA_TEST_CAPABILITY_MASK) == SPEC_CONSTANT_ALPHA_TEST_CAPABILITY_MASK))
++    {
++        if (!recovered)
++        {
++            recompiler = {};
++            recompiler.recompile(shader.data, include, false);
++            assert((recompiler.specConstantsMask & SPEC_CONSTANT_ALPHA_TEST_CAPABILITY_MASK) == SPEC_CONSTANT_ALPHA_TEST_CAPABILITY_MASK);
++            assert(recompiler.usedTextureMask == shader.usedTextureMask);
++        }
++
++        {
++            std::lock_guard lock(dxcCompilerMutex);
++            spirv = dxcCompiler.compile(recovered ? shader.recoveredLate : recompiler.out, true, false, true);
++        }
++        assert(spirv != nullptr);
++
++        result = smolv::Encode(spirv->GetBufferPointer(), spirv->GetBufferSize(), shader.lateSpirv, smolv::kEncodeFlagStripDebugInfo);
++        assert(result);
++
++        spirv->Release();
++    }
++
+     size_t currentProgress = ++progress;
+     if ((currentProgress % 10) == 0 || (currentProgress == numShaders - 1))
+         fmt::println("Recompiling shaders... {}%", currentProgress / float(numShaders) * 100.0f);
+@@ -76,7 +121,8 @@ int main(int argc, char** argv)
+ #ifndef XENOS_RECOMP_INPUT
+     if (argc < 4)
+     {
+-        printf("Usage: XenosRecomp [input path] [output path] [shader common header file path]");
++        printf("Usage: XenosRecomp [input path] [output path] [shader common header file path] "
++               "[--preserve-sources baseline-sources.tsv] [--recovered-sources recovered-sources.tsv]\n");
+         return 0;
+     }
+ #endif
+@@ -105,6 +151,46 @@ int main(int argc, char** argv)
+ #endif
+         ;
+ 
++    PreferredShaderSources preferredSources;
++    std::string preferredSourcePath;
++    std::string recoveredSourcePath;
++    std::map<uint64_t, RecoveredShaderSource> recoveredSources;
++    for (int argument = 4; argument < argc; argument += 2)
++    {
++        const std::string_view flag(argv[argument]);
++        std::string* destination = flag == "--preserve-sources" ? &preferredSourcePath :
++            flag == "--recovered-sources" ? &recoveredSourcePath : nullptr;
++        if (!destination || !destination->empty() || argument + 1 >= argc)
++        {
++            fmt::println(stderr, "Invalid/duplicate shader source option: {}", flag);
++            return 1;
++        }
++        *destination = argv[argument + 1];
++    }
++    if (!preferredSourcePath.empty() || !recoveredSourcePath.empty())
++    {
++        if (!std::filesystem::is_directory(input))
++        {
++            fmt::println(stderr, "Shader preservation requires a complete input directory");
++            return 1;
++        }
++        try
++        {
++            std::ifstream sourceMap(preferredSourcePath);
++            preferredSources = ReadPreferredShaderSources(sourceMap);
++            if (!recoveredSourcePath.empty())
++            {
++                std::ifstream recoveredMap(recoveredSourcePath);
++                recoveredSources = ReadRecoveredShaderSources(recoveredMap, preferredSources);
++            }
++        }
++        catch (const std::exception& error)
++        {
++            fmt::println(stderr, "Cannot load shader-preservation source map: {}", error.what());
++            return 1;
++        }
++    }
++
+     size_t includeSize = 0;
+     auto includeData = readAllBytes(includeInput, includeSize);
+     std::string_view include(reinterpret_cast<const char*>(includeData.get()), includeSize);
+@@ -125,6 +211,7 @@ int main(int argc, char** argv)
+             size_t fileSize = 0;
+             auto fileData = readAllBytes(file.path().string().c_str(), fileSize);
+             bool foundAny = false;
++            const std::string sourceName = ShaderCacheSourceName(file.path().string());
+ 
+             for (size_t i = 0; fileSize > sizeof(ShaderContainer) && i < fileSize - sizeof(ShaderContainer) - 1;)
+             {
+@@ -137,19 +224,27 @@ int main(int argc, char** argv)
+                     shaderContainer->field20 == 0)
+                 {
+                     XXH64_hash_t hash = XXH3_64bits(shaderContainer, dataSize);
+-                    auto shader = shaders.try_emplace(hash);
+-                    if (shader.second)
++                    // A baseline hash is selected only from its original source.
++                    // Continue scanning every file/container, including duplicates;
++                    // no corpus files are removed to influence traversal order.
++                    if (IsPreferredShaderSource(preferredSources, hash, sourceName))
+                     {
+-                        shader.first->second.data = fileData.get() + i;
+-                        foundAny = true;
+-                        shaderFilenames[hash] = file.path().string();
++                        auto shader = shaders.try_emplace(hash);
++                        if (shader.second)
++                        {
++                            shader.first->second.data = fileData.get() + i;
++                            foundAny = true;
++                            shaderFilenames[hash] = sourceName;
++                        }
+                     }
+ 
+                     i += dataSize;
+                 }
+                 else
+                 {
+-                    i += sizeof(uint32_t);
++                    // RAGE FXC fragments don't guarantee that embedded shader
++                    // containers start on a 32-bit boundary.
++                    ++i;
+                 }
+             }
+ 
+@@ -157,6 +252,52 @@ int main(int argc, char** argv)
+                 files.emplace_back(std::move(fileData));
+         }
+ 
++        try
++        {
++            const auto recoveryDirectory = std::filesystem::path(recoveredSourcePath).parent_path();
++            const auto loadSource = [&](const std::string& filename, bool pixel)
++            {
++                std::ifstream stream(recoveryDirectory / filename, std::ios::binary);
++                if (!stream)
++                    throw std::runtime_error("cannot read recovered source: " + filename);
++                std::string source((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
++                if (stream.bad() || !HasCurrentRecoveredShaderPrefix(source, include, pixel))
++                    throw std::runtime_error("recovered source has stale/missing stage preamble or common header: " + filename);
++                return source;
++            };
++            for (const auto& [hash, source] : recoveredSources)
++            {
++                // An actual original container always takes precedence over recovery.
++                if (shaders.find(hash) != shaders.end())
++                    continue;
++                auto& shader = shaders[hash];
++                shader.recoveredEarly = loadSource(source.early, source.isPixelShader);
++                if (!source.late.empty())
++                    shader.recoveredLate = loadSource(source.late, source.isPixelShader);
++                shader.recoveredPixelShader = source.isPixelShader;
++                shader.specConstantsMask = source.specConstantsMask;
++                shader.usedTextureMask = source.usedTextureMask;
++                shaderFilenames[hash] = source.filename;
++            }
++        }
++        catch (const std::exception& error)
++        {
++            fmt::println(stderr, "Cannot load recovered shader sources: {}", error.what());
++            return 1;
++        }
++
++        bool missingPreferredSource = false;
++        for (const auto& [hash, filename] : preferredSources)
++        {
++            if (shaders.find(hash) == shaders.end())
++            {
++                fmt::println(stderr, "Missing baseline shader {:016X} from preferred source {}", hash, filename);
++                missingPreferredSource = true;
++            }
++        }
++        if (missingPreferredSource)
++            return 1;
++
+         std::mutex shaderQueueMutex;
+         std::deque<XXH64_hash_t> shaderQueue;
+         for (const auto& [hash, _] : shaders)
+@@ -206,17 +347,10 @@ int main(int argc, char** argv)
+ 
+         for (auto& [hash, shader] : shaders)
+         {
+-            const std::string& fullFilename = shaderFilenames[hash];
+-            std::string filename = fullFilename;
+-            size_t shaderPos = filename.find("shader");
+-            if (shaderPos != std::string::npos) {
+-                filename = filename.substr(shaderPos);
+-                // Prevent bad escape sequences in Windows shader path.
+-                std::replace(filename.begin(), filename.end(), '\\', '/');
+-            }
+-            f.println("\t{{ 0x{:X}, {}, {}, {}, {}, {}, {}, {}, \"{}\" }},",
+-                hash, dxil.size(), (shader.dxil != nullptr) ? shader.dxil->GetBufferSize() : 0,
+-                spirv.size(), shader.spirv.size(), air.size(), shader.air.size(), shader.specConstantsMask, filename);
++            const std::string& filename = shaderFilenames.at(hash);
++            const size_t dxilOffset = dxil.size();
++            const size_t spirvOffset = spirv.size();
++            const size_t airOffset = air.size();
+ 
+             if (shader.dxil != nullptr)
+             {
+@@ -229,6 +363,22 @@ int main(int argc, char** argv)
+ #endif
+ 
+             spirv.insert(spirv.end(), shader.spirv.begin(), shader.spirv.end());
++
++            const size_t lateSpirvOffset = shader.lateSpirv.empty() ? 0 : spirv.size();
++            spirv.insert(spirv.end(), shader.lateSpirv.begin(), shader.lateSpirv.end());
++
++#ifdef GTA4_RECOMP
++            f.println("\t{{ 0x{:X}, {}, {}, {}, {}, {}, {}, {}, {}, {}, \"{}\", nullptr, {} }},",
++                hash, dxilOffset, (shader.dxil != nullptr) ? shader.dxil->GetBufferSize() : 0,
++                spirvOffset, shader.spirv.size(), lateSpirvOffset, shader.lateSpirv.size(),
++                airOffset, shader.air.size(), shader.specConstantsMask, filename,
++                shader.usedTextureMask);
++#else
++            f.println("\t{{ 0x{:X}, {}, {}, {}, {}, {}, {}, {}, {}, {}, \"{}\" }},",
++                hash, dxilOffset, (shader.dxil != nullptr) ? shader.dxil->GetBufferSize() : 0,
++                spirvOffset, shader.spirv.size(), lateSpirvOffset, shader.lateSpirv.size(),
++                airOffset, shader.air.size(), shader.specConstantsMask, filename);
++#endif
+         }
+ 
+         f.println("}};");
+diff --git a/tools/XenosRecomp/XenosRecomp/pch.h b/tools/XenosRecomp/XenosRecomp/pch.h
+index b080943..5a24b50 100644
+--- a/tools/XenosRecomp/XenosRecomp/pch.h
++++ b/tools/XenosRecomp/XenosRecomp/pch.h
+@@ -17,6 +17,7 @@
+ #include <fmt/core.h>
+ #include <string>
+ #include <unordered_map>
++#include <unordered_set>
+ #include <xxhash.h>
+ #include <zstd.h>
+ 
+diff --git a/tools/XenosRecomp/XenosRecomp/shader_common.h b/tools/XenosRecomp/XenosRecomp/shader_common.h
+index 5e0b6b1..521aa3c 100644
+--- a/tools/XenosRecomp/XenosRecomp/shader_common.h
++++ b/tools/XenosRecomp/XenosRecomp/shader_common.h
+@@ -3,6 +3,9 @@
+ 
+ #define SPEC_CONSTANT_R11G11B10_NORMAL  (1 << 0)
+ #define SPEC_CONSTANT_ALPHA_TEST        (1 << 1)
++#define SPEC_CONSTANT_ALPHA_TEST_FUNCTION_SHIFT 8
++#define SPEC_CONSTANT_ALPHA_TEST_FUNCTION_MASK  0x700
++#define SPEC_CONSTANT_ALPHA_TEST_CAPABILITY_MASK 0x702
+ 
+ #ifdef UNLEASHED_RECOMP
+     #define SPEC_CONSTANT_BICUBIC_GI_FILTER (1 << 2)
+@@ -32,18 +35,37 @@ struct PushConstants
+ 
+ [[vk::push_constant]] ConstantBuffer<PushConstants> g_PushConstants;
+ 
+-#define g_Booleans                  vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 256)
+-#define g_SwappedTexcoords          vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 260)
+-#define g_SwappedNormals            vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 264)
+-#define g_SwappedBinormals          vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 268)
+-#define g_SwappedTangents           vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 272)
+-#define g_SwappedBlendWeights       vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 276)
+-#define g_HalfPixelOffset           vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 280)
+-#define g_ClipPlane                 vk::RawBufferLoad<float4>(g_PushConstants.SharedConstants + 288)
+-#define g_ClipPlaneEnabled          vk::RawBufferLoad<bool>(g_PushConstants.SharedConstants + 304)
+-#define g_AlphaThreshold            vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 308)
+-#define g_conditionalSurveyIndex    vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 312)
+-#define g_conditionalRenderingIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 316)
++#ifdef GTA4_RECOMP
++#define GetTextureLodBias(SLOT) vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 752 + (SLOT) * 4)
++#define g_Booleans                  vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 528)
++#define g_SwappedTexcoords          vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 532)
++#define g_SwappedNormals            vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 536)
++#define g_SwappedBinormals          vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 540)
++#define g_SwappedTangents           vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 544)
++#define g_SwappedBlendWeights       vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 548)
++#define g_HalfPixelOffset           vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 552)
++#define g_ClipPlane                 vk::RawBufferLoad<float4>(g_PushConstants.SharedConstants + 560)
++#define g_ClipPlaneEnabled          vk::RawBufferLoad<bool>(g_PushConstants.SharedConstants + 576)
++#define g_AlphaThreshold            vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 580)
++#define g_conditionalSurveyIndex    vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 584)
++#define g_conditionalRenderingIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 588)
++#define g_AlphaToMask               vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 736)
++#define g_AlphaToMaskSampleCount    vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 740)
++#define g_FragmentCoordinateScale   vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 744)
++#else
++#define g_Booleans                  vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 320)
++#define g_SwappedTexcoords          vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 324)
++#define g_SwappedNormals            vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 328)
++#define g_SwappedBinormals          vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 332)
++#define g_SwappedTangents           vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 336)
++#define g_SwappedBlendWeights       vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 340)
++#define g_HalfPixelOffset           vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 344)
++#define g_ClipPlane                 vk::RawBufferLoad<float4>(g_PushConstants.SharedConstants + 352)
++#define g_ClipPlaneEnabled          vk::RawBufferLoad<bool>(g_PushConstants.SharedConstants + 368)
++#define g_AlphaThreshold            vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 372)
++#define g_conditionalSurveyIndex    vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 376)
++#define g_conditionalRenderingIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 380)
++#endif
+ 
+ [[vk::constant_id(0)]] const uint g_SpecConstants = 0;
+ 
+@@ -70,39 +92,121 @@ struct PushConstants
+     ulong SharedConstants;
+ };
+ 
+-#define g_Booleans (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 256)))
+-#define g_SwappedTexcoords (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 260)))
+-#define g_SwappedNormals (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 264)))
+-#define g_SwappedBinormals (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 268)))
+-#define g_SwappedTangents (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 272)))
+-#define g_SwappedBlendWeights (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 276)))
+-#define g_HalfPixelOffset (*(reinterpret_cast<device float2*>(g_PushConstants.SharedConstants + 280)))
+-#define g_ClipPlane (*(reinterpret_cast<device float4*>(g_PushConstants.SharedConstants + 288)))
+-#define g_ClipPlaneEnabled (*(reinterpret_cast<device bool*>(g_PushConstants.SharedConstants + 304)))
+-#define g_AlphaThreshold (*(reinterpret_cast<device float*>(g_PushConstants.SharedConstants + 308)))
+-#define g_conditionalSurveyIndex (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 312)))
+-#define g_conditionalRenderingIndex (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 316)))
++#ifdef GTA4_RECOMP
++#define GetTextureLodBias(SLOT) (*(reinterpret_cast<device float*>(g_PushConstants.SharedConstants + 752 + (SLOT) * 4)))
++#define g_Booleans (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 528)))
++#define g_SwappedTexcoords (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 532)))
++#define g_SwappedNormals (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 536)))
++#define g_SwappedBinormals (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 540)))
++#define g_SwappedTangents (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 544)))
++#define g_SwappedBlendWeights (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 548)))
++#define g_HalfPixelOffset (*(reinterpret_cast<device float2*>(g_PushConstants.SharedConstants + 552)))
++#define g_ClipPlane (*(reinterpret_cast<device float4*>(g_PushConstants.SharedConstants + 560)))
++#define g_ClipPlaneEnabled (*(reinterpret_cast<device bool*>(g_PushConstants.SharedConstants + 576)))
++#define g_AlphaThreshold (*(reinterpret_cast<device float*>(g_PushConstants.SharedConstants + 580)))
++#define g_conditionalSurveyIndex (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 584)))
++#define g_conditionalRenderingIndex (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 588)))
++#define g_FragmentCoordinateScale (*(reinterpret_cast<device float2*>(g_PushConstants.SharedConstants + 744)))
++#else
++#define g_Booleans (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 320)))
++#define g_SwappedTexcoords (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 324)))
++#define g_SwappedNormals (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 328)))
++#define g_SwappedBinormals (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 332)))
++#define g_SwappedTangents (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 336)))
++#define g_SwappedBlendWeights (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 340)))
++#define g_HalfPixelOffset (*(reinterpret_cast<device float2*>(g_PushConstants.SharedConstants + 344)))
++#define g_ClipPlane (*(reinterpret_cast<device float4*>(g_PushConstants.SharedConstants + 352)))
++#define g_ClipPlaneEnabled (*(reinterpret_cast<device bool*>(g_PushConstants.SharedConstants + 368)))
++#define g_AlphaThreshold (*(reinterpret_cast<device float*>(g_PushConstants.SharedConstants + 372)))
++#define g_conditionalSurveyIndex (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 376)))
++#define g_conditionalRenderingIndex (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + 380)))
++#endif
+ 
+ #else
+ 
++#ifdef GTA4_RECOMP
++#define GetTextureLodBias(SLOT) g_TextureLodBias[(SLOT) / 4][(SLOT) % 4]
++#define DEFINE_SHARED_CONSTANTS() \
++    uint g_Booleans : packoffset(c33.x); \
++    uint g_SwappedTexcoords : packoffset(c33.y); \
++    uint g_SwappedNormals : packoffset(c33.z); \
++    uint g_SwappedBinormals : packoffset(c33.w); \
++    uint g_SwappedTangents : packoffset(c34.x);  \
++    uint g_SwappedBlendWeights : packoffset(c34.y); \
++    float2 g_HalfPixelOffset : packoffset(c34.z); \
++    float4 g_ClipPlane : packoffset(c35.x); \
++    bool g_ClipPlaneEnabled : packoffset(c36.x); \
++    float g_AlphaThreshold : packoffset(c36.y); \
++    uint g_conditionalSurveyIndex : packoffset(c36.z); \
++    uint g_conditionalRenderingIndex : packoffset(c36.w); \
++    float2 g_FragmentCoordinateScale : packoffset(c46.z); \
++    float4 g_TextureLodBias[7] : packoffset(c47);
++#else
+ #define DEFINE_SHARED_CONSTANTS() \
+-    uint g_Booleans : packoffset(c16.x); \
+-    uint g_SwappedTexcoords : packoffset(c16.y); \
+-    uint g_SwappedNormals : packoffset(c16.z); \
+-    uint g_SwappedBinormals : packoffset(c16.w); \
+-    uint g_SwappedTangents : packoffset(c17.x);  \
+-    uint g_SwappedBlendWeights : packoffset(c17.y); \
+-    float2 g_HalfPixelOffset : packoffset(c17.z); \
+-    float4 g_ClipPlane : packoffset(c18.x); \
+-    bool g_ClipPlaneEnabled : packoffset(c19.x); \
+-    float g_AlphaThreshold : packoffset(c19.y); \
+-    uint g_conditionalSurveyIndex : packoffset(c19.z); \
+-    uint g_conditionalRenderingIndex : packoffset(c19.w);
++    uint g_Booleans : packoffset(c20.x); \
++    uint g_SwappedTexcoords : packoffset(c20.y); \
++    uint g_SwappedNormals : packoffset(c20.z); \
++    uint g_SwappedBinormals : packoffset(c20.w); \
++    uint g_SwappedTangents : packoffset(c21.x);  \
++    uint g_SwappedBlendWeights : packoffset(c21.y); \
++    float2 g_HalfPixelOffset : packoffset(c21.z); \
++    float4 g_ClipPlane : packoffset(c22.x); \
++    bool g_ClipPlaneEnabled : packoffset(c23.x); \
++    float g_AlphaThreshold : packoffset(c23.y); \
++    uint g_conditionalSurveyIndex : packoffset(c23.z); \
++    uint g_conditionalRenderingIndex : packoffset(c23.w);
++#endif
+ 
+ uint g_SpecConstants();
+ 
+ #endif
+ 
++#if defined(GTA4_RECOMP) && defined(__spirv__)
++uint ComputeXenosAlphaToMask(float alpha, float2 position, uint alphaToMask,
++                             uint sampleCount)
++{
++    if ((alphaToMask & 0x100u) == 0u)
++        return 0xFFFFFFFFu;
++
++    uint offsetIndex = (uint(position.x) & 1u) | ((uint(position.y) & 1u) << 1u);
++    uint offset = (alphaToMask >> (offsetIndex << 1u)) & 3u;
++    float thresholdOffset = float(offset);
++    uint sampleMask = 0u;
++
++    if (sampleCount == 1u)
++    {
++        if (alpha >= 1.0 - thresholdOffset * 0.25)
++            sampleMask |= 1u;
++    }
++    else if (sampleCount == 2u)
++    {
++        // Xenos top and bottom samples map to Vulkan samples 1 and 0.
++        if (alpha >= 0.5 - thresholdOffset * 0.125)
++            sampleMask |= 2u;
++        if (alpha >= 1.0 - thresholdOffset * 0.125)
++            sampleMask |= 1u;
++    }
++    else if (sampleCount == 4u)
++    {
++        // Xenos TL, BL, TR, BR map to Vulkan TL, TR, BL, BR.
++        if (alpha >= 0.75 - thresholdOffset * 0.0625)
++            sampleMask |= 1u;
++        if (alpha >= 0.25 - thresholdOffset * 0.0625)
++            sampleMask |= 4u;
++        if (alpha >= 0.5 - thresholdOffset * 0.0625)
++            sampleMask |= 2u;
++        if (alpha >= 1.0 - thresholdOffset * 0.0625)
++            sampleMask |= 8u;
++    }
++    else
++    {
++        return 0xFFFFFFFFu;
++    }
++
++    return sampleMask;
++}
++#endif
++
+ float4 cube(float4 value)
+ {
+     float3 src = value.zwx;
+@@ -193,6 +297,11 @@ struct Texture2DArrayDescriptorHeap
+     texture2d_array<float> tex;
+ };
+ 
++struct Texture3DDescriptorHeap
++{
++    texture3d<float> tex;
++};
++
+ struct TextureCubeDescriptorHeap
+ {
+     texturecube<float> tex;
+@@ -218,41 +327,106 @@ uint3 getTexture2DArrayDimensions(texture2d_array<float> texture)
+     return uint3(texture.get_width(), texture.get_height(), texture.get_array_size());
+ }
+ 
++uint3 getTexture3DDimensions(texture3d<float> texture)
++{
++    return uint3(texture.get_width(), texture.get_height(), texture.get_depth());
++}
++
+ float4 tfetch2D(constant Texture2DDescriptorHeap* textureHeap,
+                 constant SamplerDescriptorHeap* samplerHeap,
+                 uint resourceDescriptorIndex,
+                 uint samplerDescriptorIndex,
+-                float2 texCoord, float2 offset)
++                float2 texCoord, float2 offset, float lodBias = 0.0)
+ {
+     texture2d<float> texture = textureHeap[resourceDescriptorIndex].tex;
+     sampler sampler = samplerHeap[samplerDescriptorIndex].samp;
+-    return texture.sample(sampler, texCoord + offset / (float2)getTexture2DDimensions(texture));
++#if defined(GTA4_RECOMP) && !defined(XENOS_RECOMP_PIXEL_SHADER)
++    return texture.sample(sampler, texCoord + offset / (float2)getTexture2DDimensions(texture), level(lodBias));
++#else
++    return texture.sample(sampler, texCoord + offset / (float2)getTexture2DDimensions(texture), bias(lodBias));
++#endif
+ }
+ 
+ float4 tfetch2DArray(constant Texture2DArrayDescriptorHeap* textureHeap,
+                      constant SamplerDescriptorHeap* samplerHeap,
+                      uint resourceDescriptorIndex,
+                      uint samplerDescriptorIndex,
+-                     float3 texCoord, float3 offset)
++                     float3 texCoord, float3 offset, float lodBias = 0.0)
+ {
+     texture2d_array<float> texture = textureHeap[resourceDescriptorIndex].tex;
+     sampler sampler = samplerHeap[samplerDescriptorIndex].samp;
+     uint3 dimensions = getTexture2DArrayDimensions(texture);
+-    return texture.sample(sampler, texCoord.xy + offset.xy / float2(dimensions.xy), uint(texCoord.z * dimensions.z));
++#if defined(GTA4_RECOMP) && !defined(XENOS_RECOMP_PIXEL_SHADER)
++    return texture.sample(sampler, texCoord.xy + offset.xy / float2(dimensions.xy), uint(texCoord.z * dimensions.z), level(lodBias));
++#else
++    return texture.sample(sampler, texCoord.xy + offset.xy / float2(dimensions.xy), uint(texCoord.z * dimensions.z), bias(lodBias));
++#endif
++}
++
++float4 tfetch3D(constant Texture3DDescriptorHeap* textureHeap,
++                constant SamplerDescriptorHeap* samplerHeap,
++                uint resourceDescriptorIndex,
++                uint samplerDescriptorIndex,
++                float3 texCoord, float3 offset, float lodBias = 0.0)
++{
++    texture3d<float> texture = textureHeap[resourceDescriptorIndex].tex;
++    sampler sampler = samplerHeap[samplerDescriptorIndex].samp;
++#if defined(GTA4_RECOMP) && !defined(XENOS_RECOMP_PIXEL_SHADER)
++    return texture.sample(sampler, texCoord + offset / float3(getTexture3DDimensions(texture)), level(lodBias));
++#else
++    return texture.sample(sampler, texCoord + offset / float3(getTexture3DDimensions(texture)), bias(lodBias));
++#endif
+ }
+ 
+ float4 tfetchCube(constant TextureCubeDescriptorHeap* textureHeap,
+                   constant SamplerDescriptorHeap* samplerHeap,
+                   uint resourceDescriptorIndex,
+                   uint samplerDescriptorIndex,
+-                  float3 texCoord)
++                  float3 texCoord, float lodBias = 0.0)
+ {
+     texturecube<float> texture = textureHeap[resourceDescriptorIndex].tex;
+     sampler sampler = samplerHeap[samplerDescriptorIndex].samp;
+     float3 dir = cubeDir(texCoord);
+-    return texture.sample(sampler, dir);
++#if defined(GTA4_RECOMP) && !defined(XENOS_RECOMP_PIXEL_SHADER)
++    return texture.sample(sampler, dir, level(lodBias));
++#else
++    return texture.sample(sampler, dir, bias(lodBias));
++#endif
+ }
+ 
++#ifdef GTA4_RECOMP
++// Explicit texture levels are separate from implicit sampling plus bias. The
++// caller combines register LOD, fetch-constant bias and instruction bias once.
++float4 tfetch2DLod(constant Texture2DDescriptorHeap* textureHeap,
++                   constant SamplerDescriptorHeap* samplerHeap,
++                   uint resourceDescriptorIndex, uint samplerDescriptorIndex,
++                   float2 texCoord, float2 offset, float lod)
++{
++    texture2d<float> texture = textureHeap[resourceDescriptorIndex].tex;
++    return texture.sample(samplerHeap[samplerDescriptorIndex].samp,
++        texCoord + offset / float2(getTexture2DDimensions(texture)), level(lod));
++}
++
++float4 tfetch3DLod(constant Texture3DDescriptorHeap* textureHeap,
++                   constant SamplerDescriptorHeap* samplerHeap,
++                   uint resourceDescriptorIndex, uint samplerDescriptorIndex,
++                   float3 texCoord, float3 offset, float lod)
++{
++    texture3d<float> texture = textureHeap[resourceDescriptorIndex].tex;
++    return texture.sample(samplerHeap[samplerDescriptorIndex].samp,
++        texCoord + offset / float3(getTexture3DDimensions(texture)), level(lod));
++}
++
++float4 tfetchCubeLod(constant TextureCubeDescriptorHeap* textureHeap,
++                     constant SamplerDescriptorHeap* samplerHeap,
++                     uint resourceDescriptorIndex, uint samplerDescriptorIndex,
++                     float3 texCoord, float lod)
++{
++    return textureHeap[resourceDescriptorIndex].tex.sample(
++        samplerHeap[samplerDescriptorIndex].samp, cubeDir(texCoord), level(lod));
++}
++#endif
++
+ float2 getWeights2D(constant Texture2DDescriptorHeap* textureHeap,
+                     constant SamplerDescriptorHeap* samplerHeap,
+                     uint resourceDescriptorIndex,
+@@ -273,15 +447,27 @@ float3 getWeights2DArray(constant Texture2DArrayDescriptorHeap* textureHeap,
+     return select(fract(texCoord * float3(getTexture2DArrayDimensions(texture)) + offset - 0.5), 0.0, isnan(texCoord));
+ }
+ 
++float3 getWeights3D(constant Texture3DDescriptorHeap* textureHeap,
++                    constant SamplerDescriptorHeap* samplerHeap,
++                    uint resourceDescriptorIndex,
++                    uint samplerDescriptorIndex,
++                    float3 texCoord, float3 offset)
++{
++    texture3d<float> texture = textureHeap[resourceDescriptorIndex].tex;
++    return select(fract(texCoord * float3(getTexture3DDimensions(texture)) + offset - 0.5),
++                  0.0, isnan(texCoord));
++}
++
+ #else
+ 
+ Texture2D<float4> g_Texture2DDescriptorHeap[] : register(t0, space0);
+ Texture2DArray<float4> g_Texture2DArrayDescriptorHeap[] : register(t0, space1);
+-TextureCube<float4> g_TextureCubeDescriptorHeap[] : register(t0, space2);
+-SamplerState g_SamplerDescriptorHeap[] : register(s0, space3);
++Texture3D<float4> g_Texture3DDescriptorHeap[] : register(t0, space2);
++TextureCube<float4> g_TextureCubeDescriptorHeap[] : register(t0, space3);
++SamplerState g_SamplerDescriptorHeap[] : register(s0, space4);
+ 
+ #ifdef MARATHON_RECOMP
+-RWStructuredBuffer<uint> g_ConditionalSurveyBuffer : register(u0, space4);
++RWStructuredBuffer<uint> g_ConditionalSurveyBuffer : register(u0, space5);
+ #endif
+ 
+ uint2 getTexture2DDimensions(Texture2D<float4> texture)
+@@ -298,26 +484,88 @@ uint3 getTexture2DArrayDimensions(Texture2DArray<float4> texture)
+     return dimensions.xyz;
+ }
+ 
+-float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
++uint3 getTexture3DDimensions(Texture3D<float4> texture)
++{
++    uint3 dimensions;
++    texture.GetDimensions(dimensions.x, dimensions.y, dimensions.z);
++    return dimensions;
++}
++
++// Pixel shaders need implicit derivatives for authored mip selection,
++// trilinear filtering and anisotropic footprints. Vertex shaders still use
++// explicit base level zero because implicit derivatives are not available there.
++// Sampler bias applies to both base LOD modes (Vulkan LOD Operation).
++float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset, float lodBias = 0.0)
+ {
+     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
+-    return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture));
++#ifdef XENOS_RECOMP_PIXEL_SHADER
++    return texture.SampleBias(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture), lodBias);
++#else
++    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture), lodBias);
++#endif
+ }
+ 
+-float4 tfetch2DArray(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float3 offset)
++float4 tfetch2DArray(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float3 offset, float lodBias = 0.0)
+ {
+     Texture2DArray<float4> texture = g_Texture2DArrayDescriptorHeap[resourceDescriptorIndex];
+     uint3 dimensions = getTexture2DArrayDimensions(texture);
+-    return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], float3(texCoord.xy + offset.xy / dimensions.xy, texCoord.z * dimensions.z));
++#ifdef XENOS_RECOMP_PIXEL_SHADER
++    return texture.SampleBias(g_SamplerDescriptorHeap[samplerDescriptorIndex], float3(texCoord.xy + offset.xy / dimensions.xy, texCoord.z * dimensions.z), lodBias);
++#else
++    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], float3(texCoord.xy + offset.xy / dimensions.xy, texCoord.z * dimensions.z), lodBias);
++#endif
++}
++
++float4 tfetch3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float3 offset, float lodBias = 0.0)
++{
++    Texture3D<float4> texture = g_Texture3DDescriptorHeap[resourceDescriptorIndex];
++    uint3 dimensions = getTexture3DDimensions(texture);
++#ifdef XENOS_RECOMP_PIXEL_SHADER
++    return texture.SampleBias(g_SamplerDescriptorHeap[samplerDescriptorIndex],
++                          texCoord + offset / dimensions, lodBias);
++#else
++    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex],
++                               texCoord + offset / dimensions, lodBias);
++#endif
+ }
+ 
+-float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord)
++float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float lodBias = 0.0)
+ {
+     float3 dir = cubeDir(texCoord);
+-    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].Sample(
+-        g_SamplerDescriptorHeap[samplerDescriptorIndex], dir);
++#ifdef XENOS_RECOMP_PIXEL_SHADER
++    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].SampleBias(
++        g_SamplerDescriptorHeap[samplerDescriptorIndex], dir, lodBias);
++#else
++    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].SampleLevel(
++        g_SamplerDescriptorHeap[samplerDescriptorIndex], dir, lodBias);
++#endif
++}
++
++#ifdef GTA4_RECOMP
++float4 tfetch2DLod(uint resourceDescriptorIndex, uint samplerDescriptorIndex,
++                   float2 texCoord, float2 offset, float lod)
++{
++    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
++    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex],
++        texCoord + offset / getTexture2DDimensions(texture), lod);
++}
++
++float4 tfetch3DLod(uint resourceDescriptorIndex, uint samplerDescriptorIndex,
++                   float3 texCoord, float3 offset, float lod)
++{
++    Texture3D<float4> texture = g_Texture3DDescriptorHeap[resourceDescriptorIndex];
++    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex],
++        texCoord + offset / getTexture3DDimensions(texture), lod);
+ }
+ 
++float4 tfetchCubeLod(uint resourceDescriptorIndex, uint samplerDescriptorIndex,
++                     float3 texCoord, float lod)
++{
++    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].SampleLevel(
++        g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeDir(texCoord), lod);
++}
++#endif
++
+ float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
+ {
+     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
+@@ -330,6 +578,13 @@ float3 getWeights2DArray(uint resourceDescriptorIndex, uint samplerDescriptorInd
+     return select(isnan(texCoord), 0.0, frac(texCoord * getTexture2DArrayDimensions(texture) + offset - 0.5));
+ }
+ 
++float3 getWeights3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float3 offset)
++{
++    Texture3D<float4> texture = g_Texture3DDescriptorHeap[resourceDescriptorIndex];
++    return select(isnan(texCoord), 0.0,
++                  frac(texCoord * getTexture3DDimensions(texture) + offset - 0.5));
++}
++
+ #endif
+ 
+ #ifdef __air__
+diff --git a/tools/XenosRecomp/XenosRecomp/shader_recompiler.cpp b/tools/XenosRecomp/XenosRecomp/shader_recompiler.cpp
+index bb8a47e..6a0aca4 100644
+--- a/tools/XenosRecomp/XenosRecomp/shader_recompiler.cpp
++++ b/tools/XenosRecomp/XenosRecomp/shader_recompiler.cpp
+@@ -1,3 +1,4 @@
++#include <stdexcept>
+ #include "shader_recompiler.h"
+ #include "shader_common.h"
+ 
+@@ -17,7 +18,13 @@ static constexpr const char* USAGE_TYPES[] =
+ {
+     "float4", // POSITION
+     "float4", // BLENDWEIGHT
++#ifdef GTA4_RECOMP
++    // GTA IV declares blend indices as D3DCOLOR and consumes the normalized
++    // values as floats before scaling them into its constant palette.
++    "float4", // BLENDINDICES
++#else
+     "uint4", // BLENDINDICES
++#endif
+     "float4", // NORMAL
+     "float4", // PSIZE
+     "float4", // TEXCOORD
+@@ -97,6 +104,28 @@ static constexpr DeclUsageLocation USAGE_LOCATIONS[] =
+     { DeclUsage::Color, 0, 17 },
+     { DeclUsage::BlendIndices, 0, 18 },
+     { DeclUsage::BlendWeight, 0, 19 },
++    // GTA IV extensions — TexCoord 4-15 at locations 20-31 (matches INTERPOLATORS range)
++    { DeclUsage::TexCoord, 4, 20 },
++    { DeclUsage::TexCoord, 5, 21 },
++    { DeclUsage::TexCoord, 6, 22 },
++    { DeclUsage::TexCoord, 7, 23 },
++    { DeclUsage::TexCoord, 8, 24 },
++    { DeclUsage::TexCoord, 9, 25 },
++    { DeclUsage::TexCoord, 10, 26 },
++    { DeclUsage::TexCoord, 11, 27 },
++    { DeclUsage::TexCoord, 12, 28 },
++    { DeclUsage::TexCoord, 13, 29 },
++    { DeclUsage::TexCoord, 14, 30 },
++    { DeclUsage::TexCoord, 15, 31 },
++    // Additional GTA IV semantics that may appear
++    { DeclUsage::Color, 1, 32 },
++    { DeclUsage::Normal, 4, 33 },
++    { DeclUsage::Normal, 5, 34 },
++    { DeclUsage::Tangent, 4, 35 },
++    { DeclUsage::Tangent, 5, 36 },
++    { DeclUsage::Binormal, 1, 37 },
++    { DeclUsage::Binormal, 2, 38 },
++    { DeclUsage::Binormal, 3, 39 },
+ };
+ 
+ static constexpr std::pair<DeclUsage, size_t> INTERPOLATORS[] =
+@@ -121,13 +150,30 @@ static constexpr std::pair<DeclUsage, size_t> INTERPOLATORS[] =
+     { DeclUsage::Color, 1 }
+ };
+ 
+-static constexpr std::string_view TEXTURE_DIMENSIONS[] = 
++static constexpr std::string_view TEXTURE_DIMENSIONS[] =
+ {
+     "2D",
+     "2DArray",
++    "3D",
+     "Cube" 
+ };
+ 
++#ifdef GTA4_RECOMP
++static constexpr uint32_t TEXTURE_DESCRIPTOR_COUNT = 26;
++#else
++static constexpr uint32_t TEXTURE_DESCRIPTOR_COUNT = 16;
++#endif
++
++static constexpr uint32_t textureDescriptorWord(size_t dimension, uint32_t slot)
++{
++    return uint32_t(dimension) * TEXTURE_DESCRIPTOR_COUNT + slot;
++}
++
++static constexpr uint32_t textureDescriptorByteOffset(size_t dimension, uint32_t slot)
++{
++    return textureDescriptorWord(dimension, slot) * sizeof(uint32_t);
++}
++
+ static FetchDestinationSwizzle getDestSwizzle(uint32_t dstSwizzle, uint32_t index)
+ {
+     return FetchDestinationSwizzle((dstSwizzle >> (index * 3)) & 0x7);
+@@ -243,7 +289,11 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+ 
+ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicubic)
+ {
+-    if (instr.opcode != FetchOpcode::TextureFetch && instr.opcode != FetchOpcode::GetTextureWeights)
++    if (instr.opcode != FetchOpcode::TextureFetch && instr.opcode != FetchOpcode::GetTextureWeights
++#ifdef GTA4_RECOMP
++        && instr.opcode != FetchOpcode::SetTextureLod
++#endif
++    )
+         return;
+ 
+     if (instr.isPredicated)
+@@ -264,6 +314,31 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+                 out += SWIZZLES[((instr.srcSwizzle >> (i * 2))) & 0x3];
+         };
+ 
++#ifdef GTA4_RECOMP
++    // setTexLOD updates per-invocation state, not a sampler or a destination
++    // register. Keep the assignment inside the instruction's predicate scope.
++    if (instr.opcode == FetchOpcode::SetTextureLod)
++    {
++        indent();
++        out += "textureLod = ";
++        printSrcRegister(1);
++        out += ";\n";
++        if (instr.isPredicated)
++        {
++            --indentation;
++            indent();
++            out += "}\n";
++        }
++        return;
++    }
++
++    // Computed LOD is selected by the fetch instruction, not just the stage.
++    // A register LOD is an explicit level without computed LOD, and contributes
++    // to the bias when computed LOD is enabled (Xenia's fetch lowering).
++    const bool useComputedLod = instr.useCompLod &&
++        (isPixelShader || instr.useRegGradients);
++#endif
++
+     std::string constName;
+     const char* constNamePtr = nullptr;
+ #ifdef UNLEASHED_RECOMP
+@@ -339,7 +414,7 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+         componentCount = 2;
+         break;
+     case TextureDimension::Texture3D:
+-        dimension = "2DArray";
++        dimension = "3D";
+         componentCount = 3;
+         break;
+     case TextureDimension::TextureCube:
+@@ -349,6 +424,10 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+     }
+ 
+     out += dimension;
++#ifdef GTA4_RECOMP
++    if (instr.opcode == FetchOpcode::TextureFetch && !useComputedLod)
++        out += "Lod";
++#endif
+ 
+ #ifdef UNLEASHED_RECOMP
+     if (bicubic)
+@@ -378,6 +457,19 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+             break;
+     }
+ 
++    // Sampler objects use zero hardware bias on the native backend. The guest
++    // slot, not a potentially shared native sampler index, owns this value.
++#ifdef GTA4_RECOMP
++    if (instr.opcode == FetchOpcode::TextureFetch)
++    {
++        out += ", ";
++        if (instr.useRegLod)
++            out += "textureLod + ";
++        print("GetTextureLodBias({})", instr.constIndex);
++        if (instr.lodBias)
++            print(" + ({})", instr.lodBias * (1.0f / 16.0f));
++    }
++#endif
+     out += ").";
+ 
+     printDstSwizzle(instr.dstSwizzle, true);
+@@ -1283,21 +1375,151 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+     }
+ }
+ 
+-void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_view& include)
++#ifdef GTA4_RECOMP
++namespace {
++uint32_t NativeBooleanMask(uint32_t microcodeAddress)
++{
++    // The shader instruction, not CTAB presence, selects the constant bank.
++    // This also supports Boolean operands stripped from the constant table.
++    if (microcodeAddress < 16)
++        return uint32_t{1} << microcodeAddress;
++    if (microcodeAddress >= 128 && microcodeAddress < 144)
++        return uint32_t{1} << (microcodeAddress - 128 + 16);
++    throw std::runtime_error("Boolean address outside native shared-constant banks");
++}
++} // namespace
++#endif
++
++void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_view& include, bool useEarlyFragmentTests)
+ {
+     const auto shaderContainer = reinterpret_cast<const ShaderContainer*>(shaderData);
+ 
+     assert((shaderContainer->flags & 0xFFFFFF00) == 0x102A1100);
+     assert(shaderContainer->constantTableOffset != NULL);
+ 
++    isPixelShader = (shaderContainer->flags & 0x1) == 0;
++
++    if (isPixelShader)
++        out += "#if defined(__air__) && !defined(XENOS_RECOMP_PIXEL_SHADER)\n#define XENOS_RECOMP_PIXEL_SHADER\n#endif\n";
+     out += include;
+     out += '\n';
+ 
+-    isPixelShader = (shaderContainer->flags & 0x1) == 0;
++    const auto shader = reinterpret_cast<const Shader*>(shaderData + shaderContainer->shaderOffset);
++    const bool hasAlphaTestCapability = isPixelShader &&
++        (reinterpret_cast<const PixelShader*>(shader)->outputs & PIXEL_SHADER_OUTPUT_COLOR0);
+ 
+     const auto constantTableContainer = reinterpret_cast<const ConstantTableContainer*>(shaderData + shaderContainer->constantTableOffset);
+     constantTableData = reinterpret_cast<const uint8_t*>(&constantTableContainer->constantTable);
+ 
++    // ---------------------------------------------------------------------
++    // Pre-scan the Xenos microcode for every tfetch constIndex referenced.
++    //
++    // The HLSL compiler that produced the .fxc can strip a sampler entry
++    // from the D3DX9 constant table when it believes the sampler is dead,
++    // but the Xenos microcode still issues `tfetch` against that slot (the
++    // branches are usually unreachable at runtime thanks to Xenos
++    // predication, but the bytecode still contains the tfetch). Without
++    // this pre-scan, the three backend declaration loops below only emit
++    // `sN_Texture*DescriptorIndex` / `sN_SamplerDescriptorIndex` for slots
++    // that ARE in the CTAB, while the tfetch emitter at line ~284 falls
++    // back to the unnamed `s{constIndex}` form for missing slots — leaving
++    // us with undeclared-identifier errors from DXC and Metal.
++    //
++    // Collect the set of slot indices referenced by tfetch here so each
++    // backend block below can synthesize declarations for the delta.
++    // ---------------------------------------------------------------------
++    std::unordered_set<uint32_t> referencedTfetchSlots;
++    {
++        const auto scanShader = reinterpret_cast<const Shader*>(shaderData + shaderContainer->shaderOffset);
++        const be<uint32_t>* scanCode = reinterpret_cast<const be<uint32_t>*>(
++            shaderData + shaderContainer->virtualSize + scanShader->physicalOffset);
++
++        union
++        {
++            ControlFlowInstruction scanCf[2];
++            struct { uint32_t sc0, sc1, sc2, sc3; };
++        };
++
++        auto scanCfPtr = scanCode;
++        uint32_t scanAddr = 0;
++        const uint32_t scanSize = scanShader->size;
++
++        while (scanAddr < scanSize)
++        {
++            sc0 = scanCfPtr[0];
++            sc1 = scanCfPtr[1] & 0xFFFF;
++            sc2 = (scanCfPtr[1] >> 16) | (scanCfPtr[2] << 16);
++            sc3 = scanCfPtr[2] >> 16;
++
++            for (auto& cf : scanCf)
++            {
++                uint32_t addr = 0, count = 0, sequence = 0;
++                bool stop = false;
++                switch (cf.opcode)
++                {
++                case ControlFlowOpcode::Exec:
++                case ControlFlowOpcode::ExecEnd:
++                    addr = cf.exec.address; count = cf.exec.count; sequence = cf.exec.sequence;
++                    stop = (cf.opcode == ControlFlowOpcode::ExecEnd);
++                    break;
++                case ControlFlowOpcode::CondExec:
++                case ControlFlowOpcode::CondExecEnd:
++                case ControlFlowOpcode::CondExecPredClean:
++                case ControlFlowOpcode::CondExecPredCleanEnd:
++                    addr = cf.condExec.address; count = cf.condExec.count; sequence = cf.condExec.sequence;
++#ifndef GTA4_RECOMP
++                    stop = (cf.opcode == ControlFlowOpcode::CondExecEnd
++                        || cf.opcode == ControlFlowOpcode::CondExecPredCleanEnd);
++#endif
++                    break;
++                case ControlFlowOpcode::CondExecPred:
++                case ControlFlowOpcode::CondExecPredEnd:
++                    addr = cf.condExecPred.address; count = cf.condExecPred.count; sequence = cf.condExecPred.sequence;
++#ifndef GTA4_RECOMP
++                    stop = (cf.opcode == ControlFlowOpcode::CondExecPredEnd);
++#endif
++                    break;
++                default:
++                    break;
++                }
++
++                const be<uint32_t>* instrWords = scanCode + addr * 3;
++                for (uint32_t i = 0; i < count; i++)
++                {
++                    if ((sequence & 0x1) != 0)
++                    {
++                        union
++                        {
++                            TextureFetchInstruction tf;
++                            struct { uint32_t tf0, tf1, tf2; };
++                        };
++                        tf0 = instrWords[i * 3 + 0];
++                        tf1 = instrWords[i * 3 + 1];
++                        tf2 = instrWords[i * 3 + 2];
++                        if (tf.opcode == FetchOpcode::TextureFetch
++                            || tf.opcode == FetchOpcode::GetTextureWeights)
++                        {
++                            referencedTfetchSlots.insert(tf.constIndex);
++                        }
++                    }
++                    sequence >>= 2;  // 2 bits per instruction (see line 2438 real-walk)
++                }
++
++                if (stop) { scanAddr = scanSize; break; }
++            }
++
++            scanCfPtr += 3;
++            scanAddr += 2;
++        }
++    }
++
++    for (uint32_t slot : referencedTfetchSlots)
++    {
++        // TextureFetchInstruction::constIndex is a five-bit Xenos field, so
++        // every possible slot has an exact bit in this 32-bit interface mask.
++        usedTextureMask |= uint32_t{1} << slot;
++    }
++
+     out += "#ifdef __spirv__\n\n";
+ 
+ #ifdef UNLEASHED_RECOMP
+@@ -1359,11 +1581,14 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
+             {
+                 println("#define {}_Texture{}DescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+-                    constantName, TEXTURE_DIMENSIONS[j], j * 64 + constantInfo->registerIndex * 4);
++                    constantName, TEXTURE_DIMENSIONS[j],
++                    textureDescriptorByteOffset(j, constantInfo->registerIndex));
+             }
+ 
+             println("#define {}_SamplerDescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+-                constantName, std::size(TEXTURE_DIMENSIONS) * 64 + constantInfo->registerIndex * 4);
++                constantName,
++                textureDescriptorByteOffset(std::size(TEXTURE_DIMENSIONS),
++                                            constantInfo->registerIndex));
+ 
+             samplers.emplace(constantInfo->registerIndex, constantName);
+             break;
+@@ -1372,6 +1597,24 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         }
+     }
+ 
++    // Synthesize declarations for tfetch slots that weren't declared by the
++    // CTAB loop above (HLSL compiler stripped them). See the pre-scan
++    // comment block earlier for context. The tfetch emitter falls back to
++    // `s{constIndex}` naming, so we emit the synthetics with the same
++    // convention so the usages resolve.
++    for (uint32_t slot : referencedTfetchSlots)
++    {
++        if (samplers.find(slot) != samplers.end())
++            continue;
++        for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
++        {
++            println("#define s{}_Texture{}DescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
++                slot, TEXTURE_DIMENSIONS[j], textureDescriptorByteOffset(j, slot));
++        }
++        println("#define s{}_SamplerDescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
++            slot, textureDescriptorByteOffset(std::size(TEXTURE_DIMENSIONS), slot));
++    }
++
+     out += "\n#elif defined(__air__)\n\n";
+ 
+     for (uint32_t i = 0; i < constantTableContainer->constantTable.constants; i++)
+@@ -1408,7 +1651,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             {
+                 uint32_t tailCount = (isPixelShader ? 224 : 256) - constantInfo->registerIndex;
+ 
+-                println("#define {}(INDEX) selectWrapper((INDEX) < {}, (*(reinterpret_cast<device float4*>(g_PushConstants.{}ShaderConstants + ({} + min(INDEX, {})) * 16))), 0.0)",
++                // Cast to uint to avoid Metal `min` overload ambiguity (uint literals like
++                // tailCount-1 when tailCount==0 become 0xFFFFFFFF which is too large for int).
++                println("#define {}(INDEX) selectWrapper((INDEX) < {}, (*(reinterpret_cast<device float4*>(g_PushConstants.{}ShaderConstants + ({} + min((uint)(INDEX), (uint){})) * 16))), 0.0)",
+                     constantName, tailCount, shaderName, constantInfo->registerIndex.get(), tailCount - 1);
+             }
+             else
+@@ -1428,11 +1673,14 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
+             {
+                 println("#define {}_Texture{}DescriptorIndex (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + {})))",
+-                    constantName, TEXTURE_DIMENSIONS[j], j * 64 + constantInfo->registerIndex * 4);
++                    constantName, TEXTURE_DIMENSIONS[j],
++                    textureDescriptorByteOffset(j, constantInfo->registerIndex));
+             }
+ 
+             println("#define {}_SamplerDescriptorIndex (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + {})))",
+-                constantName, std::size(TEXTURE_DIMENSIONS) * 64 + constantInfo->registerIndex * 4);
++                constantName,
++                textureDescriptorByteOffset(std::size(TEXTURE_DIMENSIONS),
++                                            constantInfo->registerIndex));
+ 
+             samplers.emplace(constantInfo->registerIndex, constantName);
+             break;
+@@ -1441,6 +1689,21 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         }
+     }
+ 
++    // Synthesize Metal declarations for tfetch slots missing from the CTAB
++    // (mirror of the SPIR-V synthesis above — same reasoning).
++    for (uint32_t slot : referencedTfetchSlots)
++    {
++        if (samplers.find(slot) != samplers.end())
++            continue;
++        for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
++        {
++            println("#define s{}_Texture{}DescriptorIndex (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + {})))",
++                slot, TEXTURE_DIMENSIONS[j], textureDescriptorByteOffset(j, slot));
++        }
++        println("#define s{}_SamplerDescriptorIndex (*(reinterpret_cast<device uint*>(g_PushConstants.SharedConstants + {})))",
++            slot, textureDescriptorByteOffset(std::size(TEXTURE_DIMENSIONS), slot));
++    }
++
+     out += "\n#else\n\n";
+ 
+     println("cbuffer {}ShaderConstants : register(b{}, space4)", isPixelShader ? "Pixel" : "Vertex", isPixelShader ? 1 : 0);
+@@ -1486,12 +1749,39 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+             for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
+             {
++                const uint32_t word = textureDescriptorWord(j, constantInfo->registerIndex);
+                 println("\tuint {}_Texture{}DescriptorIndex : packoffset(c{}.{});",
+-                    constantName, TEXTURE_DIMENSIONS[j], j * 4 + constantInfo->registerIndex / 4, SWIZZLES[constantInfo->registerIndex % 4]);
++                    constantName, TEXTURE_DIMENSIONS[j], word / 4, SWIZZLES[word % 4]);
+             }
+ 
++            const uint32_t samplerWord =
++                textureDescriptorWord(std::size(TEXTURE_DIMENSIONS), constantInfo->registerIndex);
+             println("\tuint {}_SamplerDescriptorIndex : packoffset(c{}.{});",
+-                constantName, 4 * std::size(TEXTURE_DIMENSIONS) + constantInfo->registerIndex / 4, SWIZZLES[constantInfo->registerIndex % 4]);
++                constantName, samplerWord / 4, SWIZZLES[samplerWord % 4]);
++        }
++    }
++
++    // Synthesize HLSL packoffset entries for tfetch slots missing from the
++    // CTAB (HLSL compiler stripped them). Tfetch emitter falls back to the
++    // `s{constIndex}` naming, so we match that here.
++    {
++        // Match the tightly packed raw-buffer layout used by SPIR-V and AIR. Each descriptor
++        // dimension contains TEXTURE_DESCRIPTOR_COUNT words, so 26-stage GTA IV segments may
++        // start in the middle of an HLSL constant register.
++        for (uint32_t slot : referencedTfetchSlots)
++        {
++            if (samplers.find(slot) != samplers.end())
++                continue;
++            for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
++            {
++                const uint32_t word = textureDescriptorWord(j, slot);
++                println("\tuint s{}_Texture{}DescriptorIndex : packoffset(c{}.{});",
++                    slot, TEXTURE_DIMENSIONS[j], word / 4, SWIZZLES[word % 4]);
++            }
++            const uint32_t samplerWord =
++                textureDescriptorWord(std::size(TEXTURE_DIMENSIONS), slot);
++            println("\tuint s{}_SamplerDescriptorIndex : packoffset(c{}.{});",
++                slot, samplerWord / 4, SWIZZLES[samplerWord % 4]);
+         }
+     }
+ 
+@@ -1515,8 +1805,6 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+     out += '\n';
+ 
+-    const auto shader = reinterpret_cast<const Shader*>(shaderData + shaderContainer->shaderOffset);
+-
+     println("struct {}", isPixelShader ? "Interpolators" : "VertexShaderInput");
+     out += "{\n";
+ 
+@@ -1653,6 +1941,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+         if (pixelShader->outputs & PIXEL_SHADER_OUTPUT_COLOR0)
+             out += "\tfloat4 oC0 : SV_Target0;\n";
++#ifdef GTA4_RECOMP
++        if (pixelShader->outputs & PIXEL_SHADER_OUTPUT_COLOR0)
++            out += "#ifdef __spirv__\n\tuint oMask : SV_Coverage;\n#endif\n";
++#endif
+         if (pixelShader->outputs & PIXEL_SHADER_OUTPUT_COLOR1)
+             out += "\tfloat4 oC1 : SV_Target1;\n";
+         if (pixelShader->outputs & PIXEL_SHADER_OUTPUT_COLOR2)
+@@ -1692,11 +1984,19 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+     out += "#ifdef __air__\n";
+ 
+     if (isPixelShader)
++    {
+         out += "[[fragment]]\n";
++
++        auto pixelShader = reinterpret_cast<const PixelShader*>(shader);
++        if (useEarlyFragmentTests && !(pixelShader->outputs & PIXEL_SHADER_OUTPUT_DEPTH))
++            out += "[[early_fragment_tests]]\n";
++    }
+     else
+         out += "[[vertex]]\n";
+ 
+-    out += "#elif !defined(__spirv__)\n";
++    out += "#else\n";
++
++    out += "#if !defined(__spirv__)\n";
+ 
+     if (isPixelShader)
+         out += "[shader(\"pixel\")]\n";
+@@ -1705,6 +2005,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+     out += "#endif\n";
+ 
++    if (isPixelShader)
++    {
++        auto pixelShader = reinterpret_cast<const PixelShader*>(shader);
++        if (useEarlyFragmentTests && !(pixelShader->outputs & PIXEL_SHADER_OUTPUT_DEPTH))
++            out += "[earlydepthstencil]\n";
++    }
++
++    out += "#endif\n";
++
+     println("{} shaderMain(", isPixelShader ? "PixelShaderOutput" : "Interpolators");
+ 
+     if (isPixelShader)
+@@ -1716,10 +2025,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+         out += "\tconstant Texture2DDescriptorHeap* g_Texture2DDescriptorHeap [[buffer(0)]],\n";
+         out += "\tconstant Texture2DArrayDescriptorHeap* g_Texture2DArrayDescriptorHeap [[buffer(1)]],\n";
+-        out += "\tconstant TextureCubeDescriptorHeap* g_TextureCubeDescriptorHeap [[buffer(2)]],\n";
+-        out += "\tconstant SamplerDescriptorHeap* g_SamplerDescriptorHeap [[buffer(3)]],\n";
++        out += "\tconstant Texture3DDescriptorHeap* g_Texture3DDescriptorHeap [[buffer(2)]],\n";
++        out += "\tconstant TextureCubeDescriptorHeap* g_TextureCubeDescriptorHeap [[buffer(3)]],\n";
++        out += "\tconstant SamplerDescriptorHeap* g_SamplerDescriptorHeap [[buffer(4)]],\n";
+ #ifdef MARATHON_RECOMP
+-        out += "\tdevice AtomicUintBuffer* g_ConditionalSurveyBuffer [[buffer(4)]],\n";
++        out += "\tdevice AtomicUintBuffer* g_ConditionalSurveyBuffer [[buffer(5)]],\n";
+ #endif
+         out += "\tconstant PushConstants& g_PushConstants [[buffer(8)]]\n";
+ 
+@@ -1738,6 +2048,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+     else
+     {
+         out += "#ifdef __air__\n";
++        // Vertex texture fetch (tfetch in a VS) does exist — RAGE uses it
++        // for skinning, projected shadow lookups, etc. Pass the same four
++        // descriptor heap buffers that the pixel-shader signature does so
++        // tfetch emission resolves regardless of shader stage.
++        out += "\tconstant Texture2DDescriptorHeap* g_Texture2DDescriptorHeap [[buffer(0)]],\n";
++        out += "\tconstant Texture2DArrayDescriptorHeap* g_Texture2DArrayDescriptorHeap [[buffer(1)]],\n";
++        out += "\tconstant Texture3DDescriptorHeap* g_Texture3DDescriptorHeap [[buffer(2)]],\n";
++        out += "\tconstant TextureCubeDescriptorHeap* g_TextureCubeDescriptorHeap [[buffer(3)]],\n";
++        out += "\tconstant SamplerDescriptorHeap* g_SamplerDescriptorHeap [[buffer(4)]],\n";
++#ifdef MARATHON_RECOMP
++        out += "\tdevice AtomicUintBuffer* g_ConditionalSurveyBuffer [[buffer(5)]],\n";
++#endif
+         out += "\tconstant PushConstants& g_PushConstants [[buffer(8)]],\n";
+         out += "\tVertexShaderInput input [[stage_in]]\n";
+         out += "#else\n";
+@@ -1770,6 +2092,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+     println("\t{0} output = ({0})0;", outputName);
+     out += "#endif\n";
+ 
++#ifdef GTA4_RECOMP
++    if (hasAlphaTestCapability)
++        out += "#ifdef __spirv__\n\toutput.oMask = 0xFFFFFFFFu;\n#endif\n";
++#endif
++
+ #ifdef UNLEASHED_RECOMP
+     if (hasMtxProjection)
+     {
+@@ -1863,6 +2190,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         }
+     }
+ 
++#ifdef GTA4_RECOMP
++    if (isPixelShader)
++    {
++        // Scale about the pixel-center origin. Scaling the raw SV_Position value
++        // about zero moves the first center below 0.5 and creates top/left seams.
++        out += "\tfloat2 guestPixelPosition = (input.iPos.xy - 0.5) * g_FragmentCoordinateScale + 0.5;\n";
++    }
++#endif
++
+     if (!isPixelShader)
+     {
+     #ifdef UNLEASHED_RECOMP
+@@ -1883,7 +2219,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             print("\tfloat4 r{} = ", i);
+             if (isPixelShader && i == ((shader->fieldC >> 8) & 0xFF))
+             {
++#ifdef GTA4_RECOMP
++                out += "float4((guestPixelPosition - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
++#else
+                 out += "float4((input.iPos.xy - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
++#endif
+             }
+         #ifdef UNLEASHED_RECOMP
+             else if (!isPixelShader && hasIndexCount && i == 0)
+@@ -1902,6 +2242,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+     out += "\tint aL = 0;\n";
+     out += "\tbool p0 = false;\n";
+     out += "\tfloat ps = 0.0;\n";
++#ifdef GTA4_RECOMP
++    out += "\tfloat textureLod = 0.0;\n";
++#endif
+     if (isPixelShader)
+     {
+ #ifdef UNLEASHED_RECOMP
+@@ -2049,6 +2392,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             uint32_t count = 0;
+             uint32_t sequence = 0;
+             bool shouldReturn = false;
++#ifdef GTA4_RECOMP
++            bool booleanExecScope = false;
++#endif
+ 
+             switch (cfInstr.opcode)
+             {
+@@ -2067,7 +2413,26 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                 address = cfInstr.condExec.address;
+                 count = cfInstr.condExec.count;
+                 sequence = cfInstr.condExec.sequence;
+-                shouldReturn = (cfInstr.opcode == ControlFlowOpcode::CondExecEnd || cfInstr.opcode == ControlFlowOpcode::CondExecEnd);
++                shouldReturn = (cfInstr.opcode == ControlFlowOpcode::CondExecEnd ||
++                                cfInstr.opcode == ControlFlowOpcode::CondExecPredCleanEnd);
++#ifdef GTA4_RECOMP
++                // cexec / cexece are real control flow. PredicateClean is a
++                // scheduling hint, not permission to discard the Boolean test.
++                // Keep cexece's shader epilogue and return inside the condition:
++                // a false conditional end continues to the following CF clause.
++                indent();
++                println("// bool-exec cf={} address={} count={} b{} expected={}",
++                    pc - 1, address, count, uint32_t(cfInstr.condExec.boolAddress),
++                    uint32_t(cfInstr.condExec.condition));
++                indent();
++                println("if ((g_Booleans & {}u) {} 0u)",
++                    NativeBooleanMask(cfInstr.condExec.boolAddress),
++                    cfInstr.condExec.condition ? "!=" : "==");
++                indent();
++                out += "{\n";
++                ++indentation;
++                booleanExecScope = true;
++#endif
+                 break;
+ 
+             case ControlFlowOpcode::CondExecPred:
+@@ -2131,11 +2496,17 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                     }
+                     else
+                     {
++#ifdef GTA4_RECOMP
++                        println("if ((g_Booleans & {}u) {} 0u)",
++                            NativeBooleanMask(cfInstr.condJmp.boolAddress),
++                            cfInstr.condJmp.condition ^ simpleControlFlow ? "!=" : "==");
++#else
+                         auto findResult = boolConstants.find(cfInstr.condJmp.boolAddress);
+                         if (findResult != boolConstants.end())
+                             println("if ((g_Booleans & {}) {}= 0)", findResult->second, cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
+                         else
+-                            println("if ({})", cfInstr.condJmp.condition ^ simpleControlFlow ? "false" : "true"); 
++                            println("if ({})", cfInstr.condJmp.condition ^ simpleControlFlow ? "false" : "true");
++#endif
+                         // println("if (b{} {}= 0)", uint32_t(cfInstr.condJmp.boolAddress), cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
+                     }
+ 
+@@ -2234,35 +2605,67 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             {
+                 if (isPixelShader)
+                 {
+-                    specConstantsMask |= SPEC_CONSTANT_ALPHA_TEST;
++                    if (hasAlphaTestCapability)
++                    {
++                        specConstantsMask |= SPEC_CONSTANT_ALPHA_TEST_CAPABILITY_MASK;
+ 
+-                    indent();
+-                    out += "BRANCH if (g_SpecConstants() & SPEC_CONSTANT_ALPHA_TEST)\n";
+-                    indent();
+-                    out += "{\n";
++                        indent();
++                        out += "BRANCH if (g_SpecConstants() & SPEC_CONSTANT_ALPHA_TEST)\n";
++                        indent();
++                        out += "{\n";
+ 
+-                    indent();
+-                    out += "\tclip(output.oC0.w - g_AlphaThreshold);\n";
++                        indent();
++                        out += "\tuint alphaTestFunction = (g_SpecConstants() >> SPEC_CONSTANT_ALPHA_TEST_FUNCTION_SHIFT) & 7u;\n";
++                        indent();
++                        out += "\tbool alphaTestPass =\n";
++                        indent();
++                        out += "\t\t(alphaTestFunction == 0u && false) ||\n";
++                        indent();
++                        out += "\t\t(alphaTestFunction == 1u && output.oC0.w < g_AlphaThreshold) ||\n";
++                        indent();
++                        out += "\t\t(alphaTestFunction == 2u && output.oC0.w == g_AlphaThreshold) ||\n";
++                        indent();
++                        out += "\t\t(alphaTestFunction == 3u && output.oC0.w <= g_AlphaThreshold) ||\n";
++                        indent();
++                        out += "\t\t(alphaTestFunction == 4u && output.oC0.w > g_AlphaThreshold) ||\n";
++                        indent();
++                        out += "\t\t(alphaTestFunction == 5u && (any(isnan(float2(output.oC0.w, g_AlphaThreshold))) || output.oC0.w != g_AlphaThreshold)) ||\n";
++                        indent();
++                        out += "\t\t(alphaTestFunction == 6u && output.oC0.w >= g_AlphaThreshold) ||\n";
++                        indent();
++                        out += "\t\t(alphaTestFunction == 7u && true);\n";
++                        indent();
++                        out += "\tclip(alphaTestPass ? 1.0 : -1.0);\n";
+ 
+-                    indent();
+-                    out += "}\n";
++                        indent();
++                        out += "}\n";
+ 
+                 #ifdef UNLEASHED_RECOMP
+-                    specConstantsMask |= SPEC_CONSTANT_ALPHA_TO_COVERAGE;
++                        specConstantsMask |= SPEC_CONSTANT_ALPHA_TO_COVERAGE;
+ 
+-                    indent();
+-                    out += "else if (g_SpecConstants() & SPEC_CONSTANT_ALPHA_TO_COVERAGE)\n";
+-                    indent();
+-                    out += "{\n";
++                        indent();
++                        out += "else if (g_SpecConstants() & SPEC_CONSTANT_ALPHA_TO_COVERAGE)\n";
++                        indent();
++                        out += "{\n";
+ 
+-                    indent();
+-                    out += "\toutput.oC0.w *= 1.0 + computeMipLevel(pixelCoord) * 0.25;\n";
+-                    indent();
+-                    out += "\toutput.oC0.w = 0.5 + (output.oC0.w - g_AlphaThreshold) / max(fwidth(output.oC0.w), 1e-6);\n";
++                        indent();
++                        out += "\toutput.oC0.w *= 1.0 + computeMipLevel(pixelCoord) * 0.25;\n";
++                        indent();
++                        out += "\toutput.oC0.w = 0.5 + (output.oC0.w - g_AlphaThreshold) / max(fwidth(output.oC0.w), 1e-6);\n";
+ 
+-                    indent();
+-                    out += "}\n";
++                        indent();
++                        out += "}\n";
+                 #endif
++
++                #ifdef GTA4_RECOMP
++                        indent();
++                        out += "#ifdef __spirv__\n";
++                        indent();
++                        out += "output.oMask = ComputeXenosAlphaToMask(output.oC0.w, guestPixelPosition, g_AlphaToMask, g_AlphaToMaskSampleCount);\n";
++                        indent();
++                        out += "#endif\n";
++                #endif
++                    }
+                 }
+                 else
+                 {
+@@ -2289,6 +2692,14 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                     out += "\t\t\tbreak;\n";
+                 }
+             }
++#ifdef GTA4_RECOMP
++            if (booleanExecScope)
++            {
++                --indentation;
++                indent();
++                out += "} // bool-exec\n";
++            }
++#endif
+         }
+ 
+         controlFlowCode += 3;
+diff --git a/tools/XenosRecomp/XenosRecomp/shader_recompiler.h b/tools/XenosRecomp/XenosRecomp/shader_recompiler.h
+index 4f468ec..d485264 100644
+--- a/tools/XenosRecomp/XenosRecomp/shader_recompiler.h
++++ b/tools/XenosRecomp/XenosRecomp/shader_recompiler.h
+@@ -33,6 +33,7 @@ struct ShaderRecompiler : StringBuffer
+     std::unordered_map<uint32_t, const char*> samplers;
+     std::unordered_map<uint32_t, uint32_t> ifEndLabels;
+     uint32_t specConstantsMask = 0;
++    uint32_t usedTextureMask = 0;
+ 
+ #ifdef UNLEASHED_RECOMP
+     bool hasMtxProjection = false;
+@@ -52,5 +53,5 @@ struct ShaderRecompiler : StringBuffer
+     void recompile(const TextureFetchInstruction& instr, bool bicubic);
+     void recompile(const AluInstruction& instr);
+ 
+-    void recompile(const uint8_t* shaderData, const std::string_view& include);
++    void recompile(const uint8_t* shaderData, const std::string_view& include, bool useEarlyFragmentTests = true);
+ };
+Submodule tools/llvm-project-libcxx contains modified content
+diff --git a/tools/llvm-project-libcxx/libcxxabi/src/cxa_guard_impl.h b/tools/llvm-project-libcxx/libcxxabi/src/cxa_guard_impl.h
+index 191a58917..438ac9386 100644
+--- a/tools/llvm-project-libcxx/libcxxabi/src/cxa_guard_impl.h
++++ b/tools/llvm-project-libcxx/libcxxabi/src/cxa_guard_impl.h
+@@ -161,6 +161,18 @@ uint32_t PlatformThreadID() {
+   static_assert(sizeof(mach_port_t) == sizeof(uint32_t), "");
+   return static_cast<uint32_t>(pthread_mach_thread_np(std::__libcpp_thread_get_current_id()));
+ }
++#elif defined(__ORBIS__) && _LIBCPP_HAS_THREAD_API_PTHREAD
++// OpenOrbis musl aliases SYS_gettid → SYS_getpid (FreeBSD has no gettid
++// syscall — the real per-thread call is SYS_thr_self=432, which musl does
++// not expose). The generic SYS_gettid branch below would therefore return
++// the same value (the process pid) for every thread, and libc++abi's
++// __cxa_guard_acquire recursion check (`*thread_id_address == current_thread_id`)
++// would fire on every cross-thread static-init race. Use the pthread_self()
++// pointer as a per-thread ID source instead — each guest thread has a unique
++// TCB pointer, the low 32 bits are sufficiently unique in practice.
++uint32_t PlatformThreadID() {
++  return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pthread_self()));
++}
+ #elif defined(SYS_gettid) && _LIBCPP_HAS_THREAD_API_PTHREAD
+ uint32_t PlatformThreadID() {
+   static_assert(sizeof(pid_t) == sizeof(uint32_t), "");
