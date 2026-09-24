@@ -98,18 +98,21 @@ jobs:
             -DCMAKE_OSX_SYSROOT=iphoneos \
             -DLIBERTY_RECOMP_IOS_CORE_ONLY=ON
 
-      - name: Confirm CMake selected LLVM 18+
+      - name: Confirm CMake selected Homebrew LLVM
         shell: bash
         run: |
           set -euo pipefail
           cache=out/build/ios-device-release/CMakeCache.txt
-          grep -E '^(CMAKE_(C|CXX)_COMPILER|CMAKE_CXX_COMPILER_ID|CMAKE_CXX_COMPILER_VERSION):' "$cache"
-          version="$(sed -n 's/^CMAKE_CXX_COMPILER_VERSION:INTERNAL=//p' "$cache")"
-          major="${version%%.*}"
-          if [[ -z "$version" || "$major" -lt 18 ]]; then
-            echo "CMake did not select Clang 18+: $version" >&2
+          grep -E '^CMAKE_(C|CXX)_COMPILER:.*=' "$cache"
+          cxx_path="$(sed -n 's/^CMAKE_CXX_COMPILER:.*=//p' "$cache")"
+          [[ "$cxx_path" == "$LLVM_PREFIX/bin/clang++" ]] || {
+            echo "CMake selected unexpected C++ compiler: $cxx_path" >&2
             exit 1
-          fi
+          }
+          "$cxx_path" -dumpversion | awk -F. '{ if ($1 < 18) exit 1 }' || {
+            echo "Selected compiler is older than Clang 18: $cxx_path" >&2
+            exit 1
+          }
 
       - name: Compile Theft4
         run: cmake --build --preset "$BUILD_PRESET" --parallel "$(sysctl -n hw.logicalcpu)"
