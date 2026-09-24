@@ -1,0 +1,141 @@
+name: Build iOS arm64 (MetalFX)
+
+on:
+  workflow_dispatch:
+    inputs:
+      game_payload_url:
+        description: >-
+          Optional HTTPS URL for a private GTA IV payload archive. The URL must
+          be supplied as a repository/environment secret named GAME_PAYLOAD_URL
+          or entered here for a one-off run; the archive is never committed.
+        required: false
+        type: string
+      apply_metal_patch:
+        description: Apply Metal-Patch when it is not already present
+        required: true
+        default: true
+        type: boolean
+  push:
+    branches: [main]
+    paths:
+      - 'Metal-Patch'
+      - 'CMakeLists.txt'
+      - 'CMakePresets.json'
+      - 'ios/**'
+      - 'glue/**'
+      - 'LibertyRecomp/**'
+      - 'LibertyRecompLib/**'
+      - '.github/workflows/build-ios-arm64.yml'
+
+permissions:
+  contents: read
+
+env:
+  BUILD_PRESET: theft4-device-release
+  CONFIGURE_PRESET: ios-device-release
+
+jobs:
+  build:
+    name: Build unsigned iOS arm64 app
+    runs-on: macos-14
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out source and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Select Xcode and inspect SDK
+        run: |
+          set -euo pipefail
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos --sdkroot /does/not/exist true 2>/dev/null || true
+
+      - name: Install build tools
+        run: |
+          brew install cmake ninja || true
+          cmake --version
+          ninja --version
+
+      - name: Apply or verify Metal patch
+        if: ${{ inputs.apply_metal_patch != false }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git apply --check Metal-Patch; then
+            git apply --index Metal-Patch
+            echo 'Metal-Patch applied.'
+          elif git apply --reverse --check Metal-Patch; then
+            echo 'Metal-Patch is already applied; continuing.'
+          else
+            echo 'Metal-Patch is neither applicable nor already applied.' >&2
+            exit 1
+          fi
+
+      - name: Stage private game payload
+        env:
+          INPUT_PAYLOAD_URL: ${{ inputs.game_payload_url }}
+          SECRET_PAYLOAD_URL: ${{ secrets.GAME_PAYLOAD_URL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          payload_url="${INPUT_PAYLOAD_URL:-${SECRET_PAYLOAD_URL:-}}"
+          payload_dir="$GITHUB_WORKSPACE/tools/local_game_payload"
+          mkdir -p "$payload_dir"
+
+          if [[ -n "$payload_url" ]]; then
+            case "$payload_url" in
+              https://*) ;;
+              *) echo 'game_payload_url must use HTTPS.' >&2; exit 1 ;;
+            esac
+            archive="$RUNNER_TEMP/game-payload.tar"
+            curl --fail --location --retry 3 --retry-all-errors \
+              --output "$archive" "$payload_url"
+            tar -xf "$archive" -C "$payload_dir"
+          fi
+
+          for required in default.xex common.rpf xbox360.rpf audio.rpf; do
+            if [[ ! -f "$payload_dir/$required" ]]; then
+              echo "Missing $payload_dir/$required." >&2
+              echo 'Provide a private GAME_PAYLOAD_URL archive or populate tools/local_game_payload on a self-hosted/private runner.' >&2
+              exit 1
+            fi
+          done
+
+          echo "GAME_PATH=$payload_dir" >> "$GITHUB_ENV"
+
+      - name: Configure iOS arm64 Release
+        run: cmake --preset "$CONFIGURE_PRESET"
+        env:
+          CMAKE_OSX_ARCHITECTURES: arm64
+          LIBERTY_RECOMP_EMBEDDED_GAME_PATH: ${{ github.workspace }}/tools/local_game_payload
+          GAME_PATH: ${{ github.workspace }}/tools/local_game_payload
+
+      - name: Compile Theft4
+        run: cmake --build --preset "$BUILD_PRESET" --parallel "$(sysctl -n hw.logicalcpu)"
+
+      - name: Verify arm64 app bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="out/build/ios-device-release/Release/Theft4.app"
+          [[ -d "$app" ]] || { echo "Expected app not found: $app" >&2; find out/build -maxdepth 4 -name '*.app' -print; exit 1; }
+          file "$app/Theft4" || true
+          lipo -info "$app/Theft4"
+          lipo -archs "$app/Theft4" | grep -qw arm64
+          plutil -p "$app/Info.plist" || true
+
+      - name: Package unsigned app
+        run: ditto -c -k --sequesterRsrc --keepParent 'out/build/ios-device-release/Release/Theft4.app' 'Theft4-metal-ios-arm64-unsigned.zip'
+
+      - name: Upload iOS arm64 app
+        uses: actions/upload-artifact@v4
+        with:
+          name: Theft4-metal-ios-arm64-unsigned
+          path: Theft4-metal-ios-arm64-unsigned.zip
+          if-no-files-found: error
+          retention-days: 14
