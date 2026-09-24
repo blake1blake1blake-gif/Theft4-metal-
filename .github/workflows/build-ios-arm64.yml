@@ -110,6 +110,8 @@ jobs:
           cmake --preset "$CONFIGURE_PRESET" \
             -DCMAKE_C_COMPILER="$CC" \
             -DCMAKE_CXX_COMPILER="$CXX" \
+            -DCMAKE_C_EXTENSIONS=OFF \
+            -DCMAKE_CXX_EXTENSIONS=OFF \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -DCMAKE_OSX_SYSROOT=iphoneos \
             -DLIBERTY_RECOMP_IOS_CORE_ONLY=ON
