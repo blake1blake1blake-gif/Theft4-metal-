@@ -55,16 +55,15 @@ jobs:
           llvm_prefix="$(brew --prefix llvm)"
           echo "LLVM_PREFIX=$llvm_prefix" >> "$GITHUB_ENV"
           echo "$llvm_prefix/bin" >> "$GITHUB_PATH"
-          cmake --version
-          ninja --version
           "$llvm_prefix/bin/clang" --version
           "$llvm_prefix/bin/clang++" --version
-
           clang_major="$($llvm_prefix/bin/clang -dumpversion | cut -d. -f1)"
           if [[ "$clang_major" -lt 18 ]]; then
             echo "Homebrew LLVM must be 18 or newer; found $clang_major." >&2
             exit 1
           fi
+          cmake --version
+          ninja --version
 
       - name: Apply or verify Metal patch
         if: ${{ inputs.apply_metal_patch != false }}
@@ -85,11 +84,32 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          rm -rf out/build/ios-device-release
+          export CC="$LLVM_PREFIX/bin/clang"
+          export CXX="$LLVM_PREFIX/bin/clang++"
+          echo "CC=$CC"
+          echo "CXX=$CXX"
+          "$CC" --version
+          "$CXX" --version
           cmake --preset "$CONFIGURE_PRESET" \
-            -DCMAKE_C_COMPILER="$LLVM_PREFIX/bin/clang" \
-            -DCMAKE_CXX_COMPILER="$LLVM_PREFIX/bin/clang++" \
+            -DCMAKE_C_COMPILER="$CC" \
+            -DCMAKE_CXX_COMPILER="$CXX" \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
             -DLIBERTY_RECOMP_IOS_CORE_ONLY=ON
+
+      - name: Confirm CMake selected LLVM 18+
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache=out/build/ios-device-release/CMakeCache.txt
+          grep -E '^(CMAKE_(C|CXX)_COMPILER|CMAKE_CXX_COMPILER_ID|CMAKE_CXX_COMPILER_VERSION):' "$cache"
+          version="$(sed -n 's/^CMAKE_CXX_COMPILER_VERSION:INTERNAL=//p' "$cache")"
+          major="${version%%.*}"
+          if [[ -z "$version" || "$major" -lt 18 ]]; then
+            echo "CMake did not select Clang 18+: $version" >&2
+            exit 1
+          fi
 
       - name: Compile Theft4
         run: cmake --build --preset "$BUILD_PRESET" --parallel "$(sysctl -n hw.logicalcpu)"
