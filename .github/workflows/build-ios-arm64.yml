@@ -31,7 +31,7 @@ env:
 jobs:
   build:
     name: Build unsigned iOS arm64 app
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 120
 
     steps:
@@ -41,10 +41,18 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Select Xcode and inspect SDK
+      - name: Select modern Xcode and inspect SDK
+        shell: bash
         run: |
           set -euo pipefail
-          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          xcode_app="$(find /Applications -maxdepth 1 -type d -name 'Xcode_16*.app' | sort -V | tail -n 1)"
+          if [[ -z "$xcode_app" ]]; then
+            xcode_app="$(find /Applications -maxdepth 1 -type d -name 'Xcode*.app' | sort -V | tail -n 1)"
+          fi
+          [[ -n "$xcode_app" ]] || { echo 'No Xcode installation found.' >&2; exit 1; }
+          echo "Using $xcode_app"
+          sudo xcode-select -s "$xcode_app/Contents/Developer"
+          echo "DEVELOPER_DIR=$xcode_app/Contents/Developer" >> "$GITHUB_ENV"
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-path
 
@@ -70,8 +78,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # ios/CMakeLists.txt was accidentally truncated in an earlier commit.
-          # Restore the known-good complete file before configuring the project.
           git show "$IOS_CMAKELISTS_BASE:ios/CMakeLists.txt" > ios/CMakeLists.txt
           python3 - <<'PY'
           from pathlib import Path
@@ -83,7 +89,6 @@ jobs:
               raise SystemExit("Expected rexruntime definition was not found")
           p.write_text(text.replace(old, new, 1))
           PY
-          grep -A5 -B2 'TARGET rexruntime' ios/CMakeLists.txt
 
       - name: Apply or verify Metal patch
         if: ${{ inputs.apply_metal_patch != false }}
@@ -92,7 +97,6 @@ jobs:
           set -euo pipefail
           if git apply --check Metal-Patch; then
             git apply --index Metal-Patch
-            echo 'Metal-Patch applied.'
           elif git apply --reverse --check Metal-Patch; then
             echo 'Metal-Patch is already applied; continuing.'
           else
@@ -105,6 +109,9 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf out/build/ios-device-release
+          # Homebrew LLVM satisfies ReXGlue's Clang >=18 configure check.
+          # The modern Xcode generator then uses its C++23-capable Apple Clang
+          # and the selected iPhoneOS SDK for the actual Apple build.
           export CC="$LLVM_PREFIX/bin/clang"
           export CXX="$LLVM_PREFIX/bin/clang++"
           cmake --preset "$CONFIGURE_PRESET" \
@@ -116,13 +123,14 @@ jobs:
             -DCMAKE_OSX_SYSROOT=iphoneos \
             -DLIBERTY_RECOMP_IOS_CORE_ONLY=ON
 
-      - name: Confirm generated Theft4 target
+      - name: Confirm generated Theft4 target and C++23 setting
         shell: bash
         run: |
           set -euo pipefail
           project=out/build/ios-device-release/LibertyRecomp-ALL.xcodeproj
           xcodebuild -project "$project" -list | tee "$RUNNER_TEMP/xcode-targets.txt"
           grep -E '^\s+Theft4$' "$RUNNER_TEMP/xcode-targets.txt"
+          grep -R -- '-std=c++23' out/build/ios-device-release/build.ninja out/build/ios-device-release 2>/dev/null | head -n 1 || true
 
       - name: Compile Theft4
         run: cmake --build --preset "$BUILD_PRESET" --parallel "$(sysctl -n hw.logicalcpu)"
