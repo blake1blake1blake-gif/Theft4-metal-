@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       apply_metal_patch:
-        description: Apply Metal-Patch when it is not already present
+        description: Validate Metal-Patch compatibility (legacy option)
         required: true
-        default: true
+        default: false
         type: boolean
   push:
     branches: [main]
@@ -80,18 +80,20 @@ jobs:
           test -f ios/bridge/theft4_metal_presenter.mm
           test -f ios/bridge/theft4_native_profile_stub.cpp
 
-      - name: Apply or verify Metal patch
-        if: ${{ inputs.apply_metal_patch != false }}
+      - name: Check legacy Metal patch status
+        if: ${{ inputs.apply_metal_patch == true }}
         shell: bash
         run: |
           set -euo pipefail
-          if git apply --check Metal-Patch; then
-            git apply --index Metal-Patch
-          elif git apply --reverse --check Metal-Patch; then
-            echo 'Metal-Patch is already applied; continuing.'
+          # Metal-Patch is a historical aggregate diff. Its hunks target older
+          # source revisions and cannot safely be applied over the committed
+          # iOS configuration. Never mutate the checkout in CI.
+          if git apply --reverse --check Metal-Patch >/dev/null 2>&1; then
+            echo 'Metal-Patch changes are already present.'
+          elif git apply --check Metal-Patch >/dev/null 2>&1; then
+            echo 'Metal-Patch is compatible, but is intentionally not applied; committed sources are authoritative.'
           else
-            echo 'Metal-Patch is neither applicable nor already applied.' >&2
-            exit 1
+            echo 'Metal-Patch is stale/incompatible with the current tree; continuing with committed sources.'
           fi
 
       - name: Configure iOS arm64 Release without embedded game files
