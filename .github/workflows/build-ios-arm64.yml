@@ -26,7 +26,6 @@ permissions:
 env:
   BUILD_PRESET: theft4-device-release
   CONFIGURE_PRESET: ios-device-release
-  IOS_CMAKELISTS_BASE: 7502715cf155ff465be0f56c0637d6f02c13ab91
 
 jobs:
   build:
@@ -50,7 +49,6 @@ jobs:
             xcode_app="$(find /Applications -maxdepth 1 -type d -name 'Xcode*.app' | sort -V | tail -n 1)"
           fi
           [[ -n "$xcode_app" ]] || { echo 'No Xcode installation found.' >&2; exit 1; }
-          echo "Using $xcode_app"
           sudo xcode-select -s "$xcode_app/Contents/Developer"
           echo "DEVELOPER_DIR=$xcode_app/Contents/Developer" >> "$GITHUB_ENV"
           xcodebuild -version
@@ -67,41 +65,20 @@ jobs:
           "$llvm_prefix/bin/clang" --version
           "$llvm_prefix/bin/clang++" --version
           clang_major="$($llvm_prefix/bin/clang -dumpversion | cut -d. -f1)"
-          if [[ "$clang_major" -lt 18 ]]; then
-            echo "Homebrew LLVM must be 18 or newer; found $clang_major." >&2
-            exit 1
-          fi
+          [[ "$clang_major" -ge 18 ]] || { echo "Homebrew LLVM must be 18 or newer; found $clang_major." >&2; exit 1; }
           cmake --version
           ninja --version
 
-      - name: Restore complete iOS CMake project and add core-only bridge sources
+      - name: Verify committed iOS bridge configuration
         shell: bash
         run: |
           set -euo pipefail
-          git show "$IOS_CMAKELISTS_BASE:ios/CMakeLists.txt" > ios/CMakeLists.txt
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path("ios/CMakeLists.txt")
-          text = p.read_text()
-          old = "    target_compile_definitions(rexruntime PRIVATE THEFT4_LAB_BUILD=1)"
-          new = "    if(TARGET rexruntime)\n        target_compile_definitions(rexruntime PRIVATE THEFT4_LAB_BUILD=1)\n    endif()"
-          if old not in text:
-              raise SystemExit("Expected rexruntime definition was not found")
-          text = text.replace(old, new, 1)
-          marker = "add_library(theft4_core_bridge STATIC bridge/theft4_core.cpp bridge/theft4_touch_input.cpp)"
-          additions = """add_library(theft4_core_bridge STATIC bridge/theft4_core.cpp bridge/theft4_touch_input.cpp)
-# The UIKit shell calls these C-boundary APIs in core-only builds too.
-# Keep the presenter and inert profiling controls in the bridge target.
-target_sources(theft4_core_bridge PRIVATE
-    bridge/theft4_metal_presenter.mm
-    bridge/theft4_native_profile_stub.cpp)
-"""
-          if marker not in text:
-              raise SystemExit("Core bridge target marker was not found")
-          text = text.replace(marker, additions, 1)
-          p.write_text(text)
-          PY
-          grep -A8 -B2 'theft4_native_profile_stub' ios/CMakeLists.txt
+          test -f ios/CMakeLists.txt
+          grep -F 'add_library(theft4_core_bridge STATIC' ios/CMakeLists.txt
+          grep -F 'bridge/theft4_metal_presenter.mm' ios/CMakeLists.txt
+          grep -F 'bridge/theft4_native_profile_stub.cpp' ios/CMakeLists.txt
+          test -f ios/bridge/theft4_metal_presenter.mm
+          test -f ios/bridge/theft4_native_profile_stub.cpp
 
       - name: Apply or verify Metal patch
         if: ${{ inputs.apply_metal_patch != false }}
@@ -133,7 +110,7 @@ target_sources(theft4_core_bridge PRIVATE
             -DCMAKE_OSX_SYSROOT=iphoneos \
             -DLIBERTY_RECOMP_IOS_CORE_ONLY=ON
 
-      - name: Confirm generated Theft4 target and C++23 setting
+      - name: Confirm generated Theft4 target
         shell: bash
         run: |
           set -euo pipefail
